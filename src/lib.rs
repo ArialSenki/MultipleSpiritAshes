@@ -148,6 +148,8 @@ static DISMISS_VFX_PARAM_REPORTED: AtomicBool = AtomicBool::new(false);
 static DISMISS_VFX_PARAM_MISSING_REPORTED: AtomicBool = AtomicBool::new(false);
 static LAST_CLEARED_BUDDY_STONE_EFFECT: AtomicIsize = AtomicIsize::new(0);
 static LAST_ELIGIBILITY_REQUEST_EFFECT: AtomicIsize = AtomicIsize::new(-1);
+/// Last logged combination of the game's summon gates (see "summon gates").
+static LAST_SUMMON_GATE: AtomicU64 = AtomicU64::new(u64::MAX);
 static NATIVE_CLEAR_GUARD_READY: AtomicBool = AtomicBool::new(false);
 static NATIVE_CLEAR_GUARD_STUB: AtomicIsize = AtomicIsize::new(0);
 static ORIGINAL_NATIVE_CLEAR_GROUPS: AtomicIsize = AtomicIsize::new(0);
@@ -836,7 +838,10 @@ unsafe extern "system" fn guarded_clear_owner_groups(
         && request_effect == pending_effect
         && requested_goods == PENDING_SWITCH_GOODS_ID.load(Ordering::Acquire) as i32
         && active_effect > 0
-        && request_effect != active_effect
+        // The same Ash again is a new summon when its previous instance has
+        // died (user log: Tiche re-summoned while the active Ash was the dead
+        // Tiche; the native clear removed the 5 other living Ashes).
+        && (request_effect != active_effect || !live_owner_has_effect(manager, owner_id, active_effect))
         && requested_goods > 0
         && active_goods > 0
     {
@@ -1366,6 +1371,9 @@ fn spirit_ash_task(_: &FD4TaskData) {
     extras::update_ash_cost(&state);
     update_summon_dialog_policy(manager, &all_live_effects, &mut state, "post_physics");
     extras::take_dismiss_all_request(manager, &buddy_to_trigger, &mut state);
+    if !player_dead {
+        extras::release_dead_groups(manager);
+    }
     extras::update_buddy_stone_rules();
     extras::update_damage_by_count(manager, &buddy_to_trigger, &all_live_effects);
     if settings().follow_areas {
@@ -1806,6 +1814,23 @@ fn clear_buddy_item_limits_once(
     state.summon_dialog_candidates_captured = true;
 }
 
+/// Whether a spirit ash item summons through this SpEffect: EquipParamGoods
+/// refCategory 2 (SpEffect) with refId_default = the trigger effect (2.7.2.0:
+/// 200000 -> 200000, 223000 -> 223000, upgrades 200003 -> 200003). Items whose
+/// row can't be read keep the old behaviour and count as a match.
+fn goods_matches_effect(goods: i32, effect: i32) -> bool {
+    let Ok(goods_id) = u32::try_from(goods) else {
+        return false;
+    };
+    let Ok(repository) = (unsafe { SoloParamRepository::instance() }) else {
+        return true;
+    };
+    match repository.get::<EquipParamGoods>(goods_id) {
+        Some(row) if row.ref_category() == 2 && row.ref_id_default() > 0 => row.ref_id_default() == effect,
+        _ => true,
+    }
+}
+
 fn update_summon_dialog_policy(
     manager: &SummonBuddyManager,
     live_effects: &HashSet<i32>,
@@ -1817,29 +1842,42 @@ fn update_summon_dialog_policy(
     let requested_effect = manager.request_summon_speffect_id;
     let requested_goods = manager.requested_summon_goods_id;
 
-    if active_effect > 0 && active_goods > 0 && live_effects.contains(&active_effect) {
+    // The game selects the new goods before it switches the active effect, so
+    // active_goods can briefly belong to the Ash about to be summoned. Pairing
+    // it with the still-active effect made that Ash's item look "living" (user
+    // log: Tiche's item read as Finlay's, so using it dismissed instead of
+    // summoning). A pair only counts when the item's own SpEffect is that effect.
+    let active_pair = active_effect > 0
+        && active_goods > 0
+        && live_effects.contains(&active_effect)
+        && goods_matches_effect(active_goods, active_effect);
+    let requested_pair = requested_effect > 0
+        && requested_goods > 0
+        && live_effects.contains(&requested_effect)
+        && goods_matches_effect(requested_goods, requested_effect);
+    if active_pair {
         state
             .summon_goods_by_effect
             .insert(active_effect, active_goods);
     }
-    if requested_effect > 0 && requested_goods > 0 && live_effects.contains(&requested_effect) {
+    if requested_pair {
         state
             .summon_goods_by_effect
             .insert(requested_effect, requested_goods);
     }
     state
         .summon_goods_by_effect
-        .retain(|effect, _| live_effects.contains(effect));
+        .retain(|effect, goods| live_effects.contains(effect) && goods_matches_effect(*goods, *effect));
 
     let mut active_goods_ids = state
         .summon_goods_by_effect
         .iter()
         .filter_map(|(effect, goods)| live_effects.contains(effect).then_some(*goods))
         .collect::<HashSet<_>>();
-    if active_effect > 0 && active_goods > 0 && live_effects.contains(&active_effect) {
+    if active_pair {
         active_goods_ids.insert(active_goods);
     }
-    if requested_effect > 0 && requested_goods > 0 && live_effects.contains(&requested_effect) {
+    if requested_pair {
         active_goods_ids.insert(requested_goods);
     }
 
@@ -2111,6 +2149,28 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
                 manager.is_within_activation_range
             ));
         }
+        // Diagnostic for summons the game refuses before any request reaches
+        // this task (user report: the item did nothing): the game's own gates,
+        // logged whenever one of them changes.
+        // alive_flag is left out: this task clears it every frame on purpose.
+        let gate = (u64::from(manager.is_within_activation_range) << 1)
+            | (u64::from(manager.disappear_requested) << 2)
+            | (u64::from(manager.item_use_cooldown_timer > 0.0) << 3)
+            | ((manager.active_summmon_buddy_stone_entity_id as u32 as u64) << 8);
+        if LAST_SUMMON_GATE.swap(gate, Ordering::Relaxed) != gate {
+            log_line(format_args!(
+                "summon gates: alive_flag={} activation_range={} disappear_requested={} item_cooldown={:.2} buddy_stone={} living_ashes={} active_effect={} active_goods={} selected_goods={}",
+                alive_flag,
+                manager.is_within_activation_range,
+                manager.disappear_requested,
+                manager.item_use_cooldown_timer,
+                manager.active_summmon_buddy_stone_entity_id,
+                all_live_effects.len(),
+                active_effect,
+                manager.active_summon_goods_id,
+                manager.requested_summon_goods_id
+            ));
+        }
         let request_changed = request_effect > 0 && previous_request != request_effect as isize;
         if request_changed {
             if all_live_effects.contains(&request_effect) {
@@ -2259,12 +2319,18 @@ fn arm_direct_summon_guard(
     let active_effect = i32::try_from(manager.active_summon_speffect_id).unwrap_or(0);
     let requested_goods = manager.requested_summon_goods_id;
     let cap = settings().max_active_ashes;
+    // Any other living Ash must survive the summon, not only the manager's
+    // active one: when the active Ash has just died (Godrick's arena, user
+    // log: active 204000 at HP 0) or was dismissed with its item, the native
+    // owner-wide clear used to remove every other living Ash.
+    let others_alive = living_effects
+        .iter()
+        .any(|effect| *effect != target_effect && !state.dismissed_effects.contains(effect));
     if !NATIVE_CLEAR_GUARD_READY.load(Ordering::Acquire)
         || target_effect <= 0
         || living_effects.contains(&target_effect)
         || active_effect <= 0
-        || !living_effects.contains(&active_effect)
-        || state.dismissed_effects.contains(&active_effect)
+        || !others_alive
         || requested_goods <= 0
         || (cap > 0 && living_effects.len() >= cap)
     {

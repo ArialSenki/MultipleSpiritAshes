@@ -20,6 +20,32 @@ pub extern "C" fn nt_msa_dismiss_all() {
     DISMISS_ALL_REQUESTED_AT.store(dismiss_all_clock_ms(), Ordering::Release);
 }
 
+/// Seconds a fallen Ash's group is kept before it is released.
+const DEAD_GROUP_RELEASE_DELAY_SECONDS: f32 = 2.0;
+
+/// Releases the groups of fallen Ashes. The native owner-wide clear used to
+/// drop them on the next summon; with that clear bypassed to keep the living
+/// Ashes, dead groups piled up (user log: 10 groups, 8 at HP 0) and the game
+/// then refused new summons although the summoning animation played. Only
+/// local groups whose character is dead and not already leaving are marked;
+/// every guard that undoes removal marks skips dead characters.
+pub(crate) fn release_dead_groups(manager: &mut SummonBuddyManager) {
+    let mut released = Vec::new();
+    for entry in manager.groups.iter_mut() {
+        for group in entry.second.iter_mut() {
+            if group.is_remote || group.disappear_requested || chr_alive(unsafe { group.chr_ins.as_ref() }) {
+                continue;
+            }
+            group.disappear_requested = true;
+            group.disappear_delay_sec = DEAD_GROUP_RELEASE_DELAY_SECONDS;
+            released.push(group.buddy_param_id);
+        }
+    }
+    if !released.is_empty() {
+        log_line(format_args!("dead groups released: buddies={released:?}"));
+    }
+}
+
 /// Feature switched off: a pending request is dropped.
 pub(crate) fn clear_dismiss_all_request() {
     DISMISS_ALL_REQUESTED_AT.store(0, Ordering::Release);
