@@ -1,4 +1,4 @@
-# Multiple Spirit Ashes 0.2.0
+# Multiple Spirit Ashes 0.2.1
 
 For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
 
@@ -26,7 +26,7 @@ The two files differ only in that line.
 
 The archive contains `mod/external_dlls/MultipleSpiritAshes.dll` and `mod/external_dlls/MultipleSpiritAshes.ini`. Keep the two together (the DLL reads the INI and, with `LogEnabled=true`, writes `MultipleSpiritAshes.log` next to itself) and load only one copy.
 
-NativeTweaks r135 already includes this mod (Vanilla Settings > Spirit Ashes). Use one or the other: if this DLL is loaded, the copy inside NativeTweaks stays off.
+NativeTweaks (r135 and later) already includes this mod (Vanilla Settings > Spirit Ashes). Use one or the other: if this DLL is loaded, the copy inside NativeTweaks stays off.
 
 ### Mod Organizer 2 (the author's setup)
 
@@ -55,6 +55,14 @@ external_dlls = [
 ### Elden Mod Loader (not tested)
 
 With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config.ini`), copy `MultipleSpiritAshes.dll` and `MultipleSpiritAshes.ini` into `Game\mods\`. Set `load_delay` in `mod_loader_config.ini` to a low value (e.g. `0`): the HUD rows are prepared when the game first loads its HUD.
+
+## Changes in 0.2.1
+
+Fixes from long boss fights (Godrick):
+
+- Summoning a new ash right after the current one died no longer dismisses every other living ash, and neither does summoning the same ash again after it died.
+- Using an ash's item could be taken as dismissing another living ash, so the summoning animation played but nobody came. Items are now matched to their ash by the game's own item data.
+- Fallen ashes are released two seconds after they die; they used to pile up until no new summon worked.
 
 ## Notes
 

@@ -56,7 +56,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "0.2.0-ww2710-ww2720";
+const BUILD_VERSION: &str = "0.2.1-ww2710-ww2720";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
