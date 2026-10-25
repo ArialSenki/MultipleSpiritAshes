@@ -1,5 +1,6 @@
 mod area_follow;
 mod extras;
+mod game_menus;
 mod hud;
 mod hud_movie;
 mod native_prompt;
@@ -36,6 +37,7 @@ use fromsoftware_shared::{
 };
 use area_follow::update_area_follow;
 pub use extras::{nt_msa_dismiss_all, nt_msa_set_ash_cost_percent, nt_msa_set_buddy_stone_rules};
+pub use game_menus::{nt_game_menu_last_result, nt_open_game_menu};
 use native_prompt::*;
 use pelite::pe64::Pe;
 use windows::core::PCWSTR;
