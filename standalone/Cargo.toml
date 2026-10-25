@@ -1,0 +1,35 @@
+[package]
+name = "multiple-spirit-ashes-dll"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The standalone MultipleSpiritAshes.dll (Nexus 11158): the same code as the
+# copy built into NativeTweaks.dll (../), started from DllMain and configured
+# by MultipleSpiritAshes.ini next to the DLL instead of the Hub's menu.
+[dependencies]
+multiple-spirit-ashes = { path = ".." }
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[lib]
+name = "multiple_spirit_ashes_dll"
+crate-type = ["cdylib"]
+
+[profile.release]
+# Keep the release artifact in the same shape as an ordinary development
+# build: debug info present, symbols intact. A stripped, size-minimized
+# cdylib that lives inside another process and rewrites its memory matches
+# the heuristic profile of a packed payload, and endpoint security agents
+# flag it intermittently.
+debug = 2
+strip = "none"
