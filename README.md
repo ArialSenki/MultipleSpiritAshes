@@ -27,6 +27,11 @@ leaves the game untouched. Offline only, with Easy Anti-Cheat disabled.
 - `src/hud.rs` and `src/hud_movie.rs` replace the single spirit panel with one
   row per ash. The HUD movie is patched in memory, so no game files are shipped.
 - `src/native_prompt.rs` skips the summon/replace confirmation boxes.
+- `src/extras.rs` has the summoning-monument rules, the extra costs and the
+  damage per extra ash.
+- `src/engine_patches.rs` holds the game patches the standalone DLL applies
+  for up to 500 spirits and for summoning anywhere (NativeTweaks applies the
+  same ones itself).
 
 Every hook checks the game version and the bytes it is about to change before
 touching anything.
