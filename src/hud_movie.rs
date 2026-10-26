@@ -46,7 +46,10 @@ const ROW_SHIFT_X_TWIPS: i32 = -1820;
 /// slots (user's screenshot, 24-10: first row at y 565 of 1125 -> ~200;
 /// -350 HUD px at scale 1).
 const ROW_SHIFT_Y_TWIPS: i32 = -7000;
-const ROW_COUNT: usize = 6;
+/// The game has seven friendly tag entries and binds seven tags,
+/// RemotePCTag0..6, but its movie only places six: the seventh is added.
+const ROW_COUNT: usize = 7;
+const MOVIE_ROW_TAGS: usize = 6;
 const HIDDEN_ROW_ICONS: [&[u8]; 4] = [
     b"RankIcon",
     b"BigRune",
@@ -503,6 +506,8 @@ pub(crate) struct PatchReport {
     pub ash_rows: bool,
     /// The row's dimmed name line (for an Ash being dismissed) is in place.
     pub dimmed_names: bool,
+    /// RemotePCTag6 was added for a seventh row.
+    pub extra_row: bool,
     pub changed: bool,
 }
 
@@ -542,7 +547,12 @@ pub(crate) fn patch_hud_movie(input: &[u8]) -> Result<(Option<Vec<u8>>, PatchRep
     }
 
     // Group 2: turn the remote-player tags into the Ash rows.
-    if let Some(rows) = plan_ash_rows(&tags, buddy.as_ref().map(|(_, place)| place)) {
+    // The seventh tag only goes in with the rows.
+    let mut with_row_tags = tags.clone();
+    let added = add_missing_row_tags(&mut with_row_tags).is_some();
+    if let Some(rows) = plan_ash_rows(&with_row_tags, buddy.as_ref().map(|(_, place)| place)) {
+        tags = with_row_tags;
+        report.extra_row = added;
         if rows.already_applied {
             report.ash_rows = true;
         } else {
@@ -576,6 +586,53 @@ pub(crate) fn patch_hud_movie(input: &[u8]) -> Result<(Option<Vec<u8>>, PatchRep
     let total = u32::try_from(out.len()).map_err(|_| "movie too large")?;
     out[4..8].copy_from_slice(&total.to_le_bytes());
     Ok((Some(out), report))
+}
+
+/// Adds RemotePCTag6..ROW_COUNT-1 after the last tag the movie places: a copy
+/// of it with the next name, a free depth on top, and the spacing between the
+/// last two tags (an earlier package's layout included), so a movie already
+/// laid out gets the new row in line. Returns None when nothing was added.
+fn add_missing_row_tags(tags: &mut Vec<Tag>) -> Option<()> {
+    let tag_name = |row: usize| {
+        let mut name = ROW_TAG_PREFIX.to_vec();
+        name.extend_from_slice(row.to_string().as_bytes());
+        name
+    };
+    if find_placement(tags, &tag_name(MOVIE_ROW_TAGS)).is_some() {
+        return None;
+    }
+    let (last_index, last) = find_placement(tags, &tag_name(MOVIE_ROW_TAGS - 1))?;
+    let (_, before) = find_placement(tags, &tag_name(MOVIE_ROW_TAGS - 2))?;
+    let step = last.matrix?.translate.1.checked_sub(before.matrix?.translate.1)?;
+    let mut depth = tags
+        .iter()
+        .filter(|tag| tag.code == TAG_PLACE_OBJECT2)
+        .filter_map(|tag| PlaceObject2::parse(&tag.body))
+        .map(|place| place.depth)
+        .max()?;
+    let mut previous = last;
+    let mut insert_at = last_index + 1;
+    for row in MOVIE_ROW_TAGS..ROW_COUNT {
+        let mut place = previous.clone();
+        depth = depth.checked_add(1)?;
+        place.depth = depth;
+        place.name = Some(tag_name(row));
+        let mut matrix = place.matrix?;
+        matrix.translate.1 = matrix.translate.1.checked_add(step)?;
+        place.matrix = Some(matrix);
+        let template = &tags[last_index];
+        tags.insert(
+            insert_at,
+            Tag {
+                code: TAG_PLACE_OBJECT2,
+                long_header: template.long_header,
+                body: place.encode()?,
+            },
+        );
+        insert_at += 1;
+        previous = place;
+    }
+    Some(())
 }
 
 struct AshRowsPlan {
@@ -1384,10 +1441,16 @@ pub(crate) mod tests {
         let header = |m: &[u8]| 8 + (5 + 4 * usize::from(m[8] >> 3)).div_ceil(8) + 4;
         let tags =
             |m: &[u8]| parse_tags(&m[..read_u32(m, 4).unwrap() as usize], header(m)).unwrap();
-        let (v, o, p) = (tags(&vanilla), tags(&other), tags(&patched));
+        // Without the added RemotePCTag6, tag for tag.
+        let without_added = |mut list: Vec<Tag>| {
+            let (index, _) = find_placement(&list, b"RemotePCTag6").unwrap();
+            list.remove(index);
+            list
+        };
+        let (v, o, p) = (tags(&vanilla), tags(&other), without_added(tags(&patched)));
         assert_eq!(v.len(), o.len());
         assert_eq!(o.len(), p.len());
-        let ours = tags(&patch_hud_movie(&vanilla).unwrap().0.unwrap());
+        let ours = without_added(tags(&patch_hud_movie(&vanilla).unwrap().0.unwrap()));
         for index in 0..o.len() {
             if o[index] != v[index] {
                 assert_eq!(
@@ -1411,7 +1474,7 @@ pub(crate) mod tests {
             parse_tags(&vanilla[..read_u32(&vanilla, 4).unwrap() as usize], header).unwrap();
         let factor = 52_429; // 0.8
         let mut names = vec![BUDDY_PANEL.to_vec()];
-        names.extend((0..ROW_COUNT).map(|row| format!("RemotePCTag{row}").into_bytes()));
+        names.extend((0..MOVIE_ROW_TAGS).map(|row| format!("RemotePCTag{row}").into_bytes()));
         for name in &names {
             let (index, mut place) = find_placement(&tags, name).unwrap();
             let mut matrix = place.matrix.unwrap();

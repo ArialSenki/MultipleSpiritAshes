@@ -1,16 +1,16 @@
-# Multiple Spirit Ashes 0.2.1
+# Multiple Spirit Ashes 0.2.2
 
 For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
 
 ## What it does
 
-- **Several spirit ashes at once.** Using a different spirit ash keeps the ones already summoned, up to `MaxActiveAshes` (2-20). Each ash pays its FP.
-- **Dismiss one ash.** Using a summoned ash's item again dismisses only that one, with a short fade, even when your FP is below its cost.
+- **Several spirit ashes at once.** Using a different spirit ash keeps the ones already summoned, up to 500 spirits at once (the game alone allows 10 per player). Each ash pays its FP. `MaxActiveAshes` can set a limit (0 = none, the default).
+- **Dismiss one ash.** Using a summoned ash's item again dismisses only that one, with a short fade, even when your FP is below its cost. With `RepeatSameAsh=true` it summons that ash once more instead, so you can have the same ash several times.
 - **No confirmation boxes** when you summon another ash or dismiss one.
 - **Ashes follow you.** When you cross into another area or go through a door, fog wall or lift, the game brings your ashes over with its own fade, and an ash left far behind while you travel is brought back.
-- **Summoning monuments** (on by default, they work together): summon anywhere in the monument's area without the ashes being dismissed for walking away, ashes stay after the boss of that area falls, and a fallen ash can be summoned again without resting.
+- **Summoning monuments** (on by default, they work together): summon anywhere, in every area of the game and the DLC (boss arenas included), without the ashes being dismissed for walking away; ashes stay after the boss of that area falls; a fallen ash can be summoned again without resting.
 - **Balance:** cost of every ash, cost of each extra ash, and damage lost per extra ash.
-- **HUD:** one compact row per ash with its name and HP (up to 6; "xN" for groups, "+N" when there are more), in place of the single spirit panel.
+- **HUD:** one compact row per ash with its name and HP (up to 7; "xN" for groups, "+N" when there are more), in place of the single spirit panel.
 - **Dismiss all:** an optional key dismisses every summoned ash.
 
 Everything is set in `MultipleSpiritAshes.ini` (comments explain each line). Changes apply when the game starts; the monument rules apply after the area reloads (rest at a grace).
@@ -55,6 +55,26 @@ external_dlls = [
 ### Elden Mod Loader (not tested)
 
 With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config.ini`), copy `MultipleSpiritAshes.dll` and `MultipleSpiritAshes.ini` into `Game\mods\`. Set `load_delay` in `mod_loader_config.ini` to a low value (e.g. `0`): the HUD rows are prepared when the game first loads its HUD.
+
+## Changes in 0.2.2
+
+Fixed:
+
+- Upgraded spirit ashes (+1 to +10) work with several ashes at once: they can be summoned beside others, and their item dismisses only that ash instead of summoning it again.
+- Summon anywhere works in every area of the game and the DLC, boss arenas included (Radahn's battlefield). Before, summoning was refused away from a monument, and an ash summoned there could stand frozen, could not be touched and kept playing its summoning sound. A refused summon also stayed queued and came out later in place of the ash you chose.
+- After all your ashes die you can summon again at once; before, summoning stayed blocked until you rested.
+- Summons past 10 spirits no longer spend the FP for nothing: the game keeps 10 spirits per player, so with several ashes out a summon showed only part of its spirits or none (Lone Wolf Ashes: 1 wolf of 3).
+
+Changed:
+
+- Up to 500 spirits at once, and no ash limit by default (`MaxActiveAshes=0`).
+- The HUD shows 7 ash rows (was 6).
+
+New:
+
+- `RepeatSameAsh` (off by default): using a summoned ash's item summons it once more instead of dismissing it.
+
+Update: replace the DLL and the INI (new and changed lines).
 
 ## Changes in 0.2.1
 

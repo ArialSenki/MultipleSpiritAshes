@@ -323,8 +323,9 @@ pub(crate) fn reset_damage_factor() {
 /// Summoning-monument rules (BuddyStoneParam) for the standalone DLL; in
 /// NativeTweaks the Hub's own Spirit Ashes options do this, so it never calls
 /// nt_msa_set_buddy_stone_rules and nothing here runs. Values as the Hub's:
-/// anywhere = activateRange 0xFFFF, no region, overwriteReturnRange -1 (no
-/// dismissal for walking away); keep after boss = eliminateTargetEntityId 0;
+/// anywhere = activateRange 0xFFFF and no activation region for every
+/// monument (see the Hub's sync_buddy), overwriteReturnRange -1 (no dismissal for walking away); keep
+/// after boss = eliminateTargetEntityId 0;
 /// resummon without rest = summonedEventFlagId 0. Originals are restored when
 /// a rule is turned off. Applies after the area reloads (rest at a grace).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -398,6 +399,8 @@ pub(crate) fn update_buddy_stone_rules() {
         };
         row.set_activate_range(if wanted.anywhere { u16::MAX } else { range });
         row.set_overwrite_return_range(if wanted.anywhere { -1 } else { return_range });
+        // Opened by distance everywhere, as in the Hub (see vanilla_settings.cpp):
+        // outside a region, ashes summoned from that monument freeze half-dismissed.
         row.set_overwrite_activate_region_entity_id(if wanted.anywhere { 0 } else { region });
         row.set_eliminate_target_entity_id(if wanted.keep_after_boss { 0 } else { eliminate });
         row.set_summoned_event_flag_id(if wanted.resummon_without_rest { 0 } else { flag });
@@ -408,10 +411,193 @@ pub(crate) fn update_buddy_stone_rules() {
         return;
     }
     rules.applied = Some(wanted);
+    SUMMON_ANYWHERE.store(wanted.anywhere, Ordering::Relaxed);
     log_line(format_args!(
         "summoning monument rules: rows={rows} summon_anywhere={} keep_after_boss={} resummon_without_rest={}",
         wanted.anywhere, wanted.keep_after_boss, wanted.resummon_without_rest
     ));
+}
+
+/// Summon anywhere, beyond the monument's own map tile. Each frame the game
+/// looks for a summoning monument only among the loaded ones near the player
+/// and writes it to buddy_stone_entity_id (SummonBuddyManager +0x38), 0 when
+/// there is none; item use is refused at 0 (r140 test log: Caelid and
+/// Radahn's battlefield, buddy_stone=0 with every monument rule applied). With
+/// the option on, the monument nearest to the player's map tile (else the last
+/// one the game found) is put in while none is found, so the spirit ash can be used; the summon itself appears next to the
+/// player (spawn origin synchronized). In NativeTweaks the Hub turns it on with
+/// its Summon anywhere option (nt_msa_set_summon_anywhere); the standalone DLL
+/// with its SummonAnywhere rule.
+static SUMMON_ANYWHERE: AtomicBool = AtomicBool::new(false);
+static LAST_STONE: AtomicU32 = AtomicU32::new(0);
+static STONE_FALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nt_msa_set_summon_anywhere(enabled: u8) {
+    SUMMON_ANYWHERE.store(enabled != 0, Ordering::Relaxed);
+}
+
+/// Every monument (BuddyStoneParam row id = its entity id), read once.
+static STONE_IDS: LazyLock<Mutex<Vec<u32>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// Player block (raw) -> monument picked for it, so the search runs once per tile.
+static NEAREST_STONE: Mutex<(i32, u32)> = Mutex::new((i32::MIN, 0));
+
+/// Map tile of a monument from its entity id: overworld ids are
+/// 10XXYY0NNN (m60_XX_YY) or 20XXYY0NNN (m61, the DLC); legacy dungeons are
+/// AABBNNNN (mAA_BB).
+fn stone_tile(id: u32) -> (u8, u8, u8) {
+    if id >= 1_000_000_000 {
+        let area = if id / 100_000_000 == 20 { 61 } else { 60 };
+        (area, ((id / 1_000_000) % 100) as u8, ((id / 10_000) % 100) as u8)
+    } else {
+        ((id / 1_000_000) as u8, ((id / 10_000) % 100) as u8, 0)
+    }
+}
+
+/// The monument closest to the player's map tile.
+fn nearest_stone() -> Option<u32> {
+    let world = unsafe { WorldChrMan::instance().ok()? };
+    let player = world.main_player.as_ref()?;
+    let block = player.current_block_id;
+    let position = &player.block_position;
+    let overworld = block.area() == 60 || block.area() == 61;
+    // Overworld blocks also come as larger tiles (r140 tests at Radahn:
+    // m60_25_18_01 alternating with m60_51_37_00, and m60_11_09_02 before any
+    // small one): index 1 covers 2x2 small tiles of 256 m, index 2 4x4. The
+    // small tile comes from the position, measured from the block's centre.
+    let (x, y) = if overworld {
+        let scale = 1i32 << block.index().min(2);
+        let half = scale as f32 * 128.0;
+        let sub = |v: f32| (((v + half) / 256.0).floor() as i32).clamp(0, scale - 1);
+        (block.block() as i32 * scale + sub(position.x), block.region() as i32 * scale + sub(position.z))
+    } else {
+        (block.block() as i32, 0)
+    };
+    let raw = (block.area() as i32) << 24 | x << 12 | y;
+    if let Ok(cache) = NEAREST_STONE.lock() {
+        if cache.0 == raw {
+            return (cache.1 != 0).then_some(cache.1);
+        }
+    }
+    let mut ids = STONE_IDS.lock().ok()?;
+    if ids.is_empty() {
+        let repository = unsafe { SoloParamRepository::instance().ok()? };
+        ids.extend(
+            repository
+                .rows::<BuddyStoneParam>()
+                .map(|(id, _)| id as u32),
+        );
+    }
+    let best = ids
+        .iter()
+        .filter_map(|&id| {
+            let (area, sx, sy) = stone_tile(id);
+            (area == block.area()).then(|| ((sx as i32 - x).abs().max((sy as i32 - y).abs()), id))
+        })
+        .min()
+        .map(|(_, id)| id)
+        .unwrap_or(0);
+    if let Ok(mut cache) = NEAREST_STONE.lock() {
+        *cache = (raw, best);
+    }
+    log_line(format_args!(
+        "summon anywhere: player in m{:02}_{:02}_{:02}_{:02} at ({:.0}, {:.0}) = tile {x}_{y}; nearest monument {best}",
+        block.area(),
+        block.block(),
+        block.region(),
+        block.index(),
+        position.x,
+        position.z
+    ));
+    (best != 0).then_some(best)
+}
+
+pub(crate) fn apply_stone_fallback(manager: &mut SummonBuddyManager) {
+    if !SUMMON_ANYWHERE.load(Ordering::Relaxed) {
+        return;
+    }
+    release_used_monument(manager);
+    let found = manager.buddy_stone_entity_id;
+    let last = LAST_STONE.load(Ordering::Relaxed);
+    if found != 0 {
+        if found != last {
+            LAST_STONE.store(found, Ordering::Relaxed);
+        }
+        return;
+    }
+    let Some(stone) = nearest_stone().or((last != 0).then_some(last)) else {
+        return;
+    };
+    manager.buddy_stone_entity_id = stone;
+    if STONE_FALLBACK_LOGGED.swap(stone, Ordering::Relaxed) != stone {
+        log_line(format_args!(
+            "summon anywhere: no monument found here; using monument {stone}"
+        ));
+    }
+}
+
+// The summon_buddy ChrSet (spirits and Torrent) already holds 80 entries, so
+// it is not what stops a summon at about 10 bodies (r140 test: Lone Wolf
+// Ashes gave 1 wolf of 3 with 9 bodies out, Black Knife Tiche none with 10).
+// Moving it to a larger array of our own corrupted the heap on the next map
+// load (c0000374) and was dropped.
+
+/// Logs once how many bodies each spirit ash summons (BuddyParam rows per
+/// trigger effect), to check them against what appears in the game.
+static ASH_BODIES_LOGGED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn log_ash_bodies(manager: &SummonBuddyManager, set_capacity: u32) {
+    if ASH_BODIES_LOGGED.load(Ordering::Relaxed) || manager.trigger_speffect_to_buddy_map.len() == 0 {
+        return;
+    }
+    ASH_BODIES_LOGGED.store(true, Ordering::Relaxed);
+    let mut bodies: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for (effect, buddy) in manager.trigger_speffect_to_buddy_map.iter() {
+        if *effect > 0 && *buddy > 0 {
+            *bodies.entry(*effect).or_default() += 1;
+        }
+    }
+    let multi: Vec<String> = bodies
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(effect, n)| format!("{effect}x{n}"))
+        .collect();
+    log_line(format_args!(
+        "spirit ash bodies: set capacity {set_capacity} (spirits from slot 20); {} ashes, {} bodies in all; more than one: {}",
+        bodies.len(),
+        bodies.values().sum::<usize>(),
+        multi.join(" ")
+    ));
+}
+
+/// The game refuses a summon at the monument its last summon came from
+/// (active_summmon_buddy_stone_entity_id, +0x3C, equal to the one found,
+/// +0x38) once none of those spirits is alive, until you rest: the item is not
+/// even used (r140 test at Radahn: three Black Knife Tiche died, then no Ash
+/// could be summoned, both monuments 1051390100). With Summon anywhere the
+/// link is released while no spirit is alive and nothing is being summoned or
+/// dismissed.
+static MONUMENT_RELEASE_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+fn release_used_monument(manager: &mut SummonBuddyManager) {
+    let used = manager.active_summmon_buddy_stone_entity_id;
+    if used == 0 || manager.request_summon_speffect_id > 0 || manager.disappear_requested {
+        return;
+    }
+    let any_alive = manager
+        .groups
+        .iter()
+        .flat_map(|entry| entry.second.iter())
+        .any(|group| chr_alive(unsafe { group.chr_ins.as_ref() }));
+    if any_alive {
+        return;
+    }
+    manager.active_summmon_buddy_stone_entity_id = 0;
+    if MONUMENT_RELEASE_LOGGED.swap(used, Ordering::Relaxed) != used {
+        log_line(format_args!(
+            "summon anywhere: no spirit alive; monument {used} released for the next summon"
+        ));
+    }
 }
 
 /// Spirit ash cost (%) for the standalone DLL (in NativeTweaks the Hub's own

@@ -1,6 +1,6 @@
 //! Compact Spirit Ash rows on the HUD.
 //!
-//! The rows are the game's own off-screen ally tags (`RemotePCTag0..5`),
+//! The rows are the game's own off-screen ally tags (`RemotePCTag0..6`),
 //! which `hud_movie` stacks under the hidden Spirit Ash panel. The game draws
 //! them from `CSFeManImp::friendly_chr_tag_displays`: every frame it rebuilds
 //! those entries from the real allies (empty ones are reset), then copies them
@@ -39,9 +39,9 @@ use pelite::pe64::Pe;
 
 use super::hud_movie::DIMMED_NAMES_READY;
 
-/// Friendly entries with a tag in the HUD movie (the game has seven entries,
-/// the movie six tags).
-const ROW_SLOTS: usize = 6;
+/// Friendly entries with a tag in the HUD movie: the game has seven entries
+/// and binds seven tags; `hud_movie` adds the seventh tag the movie lacks.
+const ROW_SLOTS: usize = 7;
 const FALLBACK_NAME: &str = "Spirit";
 /// MsgRepository categories the game tries, in order, for a goods name and
 /// for an NPC name (base, patch and DLC message files).
@@ -453,12 +453,8 @@ fn collect_live_ash_groups() -> Option<HashMap<i32, Vec<AshHudMember>>> {
     }
     let manager = unsafe { &mut *(manager_address as *mut SummonBuddyManager) };
 
-    let mut buddy_to_effect = HashMap::with_capacity(manager.trigger_speffect_to_buddy_map.len());
-    for (effect, buddy_param_id) in manager.trigger_speffect_to_buddy_map.iter() {
-        if *effect > 0 && *buddy_param_id > 0 {
-            buddy_to_effect.entry(*buddy_param_id).or_insert(*effect);
-        }
-    }
+    // Same map as the policy, so an upgraded Ash shows its own item's name.
+    let buddy_to_effect = super::buddy_trigger_map(manager);
 
     let repository = unsafe { SoloParamRepository::instance_mut().ok() };
     let mut groups = HashMap::<i32, Vec<AshHudMember>>::new();

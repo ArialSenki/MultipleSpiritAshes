@@ -12,8 +12,8 @@ use std::{
 };
 
 use multiple_spirit_ashes::{
-    NtMsaSettings, nt_msa_dismiss_all, nt_msa_set_ash_cost_percent, nt_msa_set_buddy_stone_rules,
-    nt_msa_start,
+    NtMsaSettings, nt_msa_dismiss_all, nt_msa_engine_patches, nt_msa_set_ash_cost_percent,
+    nt_msa_set_buddy_stone_rules, nt_msa_start,
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, HMODULE},
@@ -49,6 +49,7 @@ struct Config {
     summon_anywhere: bool,
     keep_ashes_after_boss: bool,
     resummon_without_rest: bool,
+    repeat_same_ash: bool,
     dismiss_all_key: Option<i32>,
     log_enabled: bool,
 }
@@ -57,7 +58,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_active_ashes: 8,
+            max_active_ashes: 0,
             ash_cost_percent: 100,
             extra_cost_percent: 100,
             damage_reduction_percent: 0,
@@ -65,6 +66,7 @@ impl Default for Config {
             summon_anywhere: true,
             keep_ashes_after_boss: true,
             resummon_without_rest: true,
+            repeat_same_ash: false,
             dismiss_all_key: None,
             log_enabled: false,
         }
@@ -89,6 +91,7 @@ fn run(module: isize) {
         hud_rows: u8::from(config.hud_rows),
         extra_cost_percent: config.extra_cost_percent,
         damage_reduction_percent: config.damage_reduction_percent,
+        repeat_same_ash: u8::from(config.repeat_same_ash),
     };
     nt_msa_set_ash_cost_percent(config.ash_cost_percent);
     nt_msa_set_buddy_stone_rules(
@@ -99,6 +102,9 @@ fn run(module: isize) {
     if unsafe { nt_msa_start(module as *mut c_void, &settings) } == 0 {
         return;
     }
+    // Up to 500 spirits and Summon anywhere in every area: game code patches,
+    // applied once (NativeTweaks applies the same ones from its Hub).
+    nt_msa_engine_patches(u8::from(config.enabled), u8::from(config.summon_anywhere));
     let Some(key) = config.dismiss_all_key else {
         return;
     };
@@ -147,7 +153,8 @@ fn parse_config(text: &str) -> Config {
             "enabled" => config.enabled = parse_bool(value).unwrap_or(config.enabled),
             "maxactiveashes" => {
                 if let Ok(parsed) = value.parse::<u32>() {
-                    config.max_active_ashes = parsed.clamp(2, 20);
+                    // 0 = no limit (the game's spirit set is the limit: 500 spirits).
+                    config.max_active_ashes = if parsed == 0 { 0 } else { parsed.clamp(2, 500) };
                 }
             }
             "ashcostpercent" => {
@@ -176,6 +183,9 @@ fn parse_config(text: &str) -> Config {
             "resummonwithoutrest" => {
                 config.resummon_without_rest =
                     parse_bool(value).unwrap_or(config.resummon_without_rest)
+            }
+            "repeatsameash" => {
+                config.repeat_same_ash = parse_bool(value).unwrap_or(config.repeat_same_ash)
             }
             "dismissallkey" => config.dismiss_all_key = parse_key(value),
             "logenabled" => config.log_enabled = parse_bool(value).unwrap_or(config.log_enabled),
@@ -224,7 +234,7 @@ mod tests {
              KeepAshesAfterBoss=yes\nResummonWithoutRest=on\nDismissAllKey=F5\nLogEnabled=1\n",
         );
         assert!(config.enabled);
-        assert_eq!(config.max_active_ashes, 20);
+        assert_eq!(config.max_active_ashes, 50);
         assert_eq!(config.ash_cost_percent, 300);
         assert_eq!(config.extra_cost_percent, 50);
         assert_eq!(config.damage_reduction_percent, 20);

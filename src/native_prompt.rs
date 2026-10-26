@@ -562,8 +562,11 @@ pub(crate) fn update_native_prompt_flags(
     // A Spirit Ash's goods ID is also its summon SpEffect ID (228000/228000…),
     // so a live effect identifies the goods too. The goods map alone misses
     // an Ash summoned while no other was alive.
-    let goods_is_living =
-        |goods_id: i32| active_goods_ids.contains(&goods_id) || live_effects.contains(&goods_id);
+    // Summoning the same Ash again: a living Ash's item is a new summon here.
+    let repeat = settings().repeat_same_ash;
+    let goods_is_living = |goods_id: i32| {
+        !repeat && (active_goods_ids.contains(&goods_id) || live_effects.contains(&goods_id))
+    };
     let requested_goods_is_living = goods_is_living(requested_goods);
     // The 0.1.56 policy decides "new" from its goods map only, so it can call
     // a living Ash's goods new (the first Ash summoned): re-check here.
@@ -798,6 +801,7 @@ fn update_living_ash_low_fp_costs(
         .collect::<HashSet<_>>();
     let mut desired = HashSet::new();
     if settings().toggle_dismiss
+        && !settings().repeat_same_ash
         && settings().low_fp_dismissal
         && let Some(fp) = player_fp
     {

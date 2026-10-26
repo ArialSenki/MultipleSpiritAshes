@@ -1,4 +1,5 @@
 mod area_follow;
+mod engine_patches;
 mod extras;
 mod game_menus;
 mod hud;
@@ -37,6 +38,7 @@ use fromsoftware_shared::{
 };
 use area_follow::update_area_follow;
 pub use extras::{nt_msa_dismiss_all, nt_msa_set_ash_cost_percent, nt_msa_set_buddy_stone_rules};
+pub use engine_patches::nt_msa_engine_patches;
 pub use game_menus::{nt_game_menu_last_result, nt_open_game_menu};
 use native_prompt::*;
 use pelite::pe64::Pe;
@@ -56,7 +58,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "0.2.1-ww2710-ww2720";
+const BUILD_VERSION: &str = "0.2.2-ww2710-ww2720";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
@@ -167,6 +169,10 @@ static PENDING_SWITCH_GOODS_ID: AtomicIsize = AtomicIsize::new(-1);
 static PENDING_ITEM_DISMISS_EFFECT: AtomicIsize = AtomicIsize::new(-1);
 static PENDING_ITEM_DISMISS_GOODS: AtomicIsize = AtomicIsize::new(-1);
 static LAST_SPAWN_SYNC_EFFECT: AtomicIsize = AtomicIsize::new(-1);
+/// The upgrade level in use for each spirit ash: BuddyParam -> its trigger
+/// SpEffect as the game last reported it active or requested.
+static TRIGGER_IN_USE: LazyLock<Mutex<HashMap<i32, i32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 static REPORTED_PRESERVED_EFFECTS: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static SETTINGS: RwLock<Settings> = RwLock::new(Settings::DEFAULT);
@@ -205,6 +211,9 @@ pub struct NtMsaSettings {
     pub extra_cost_percent: u32,
     /// Damage lost per extra living Ash, in % (0 = native).
     pub damage_reduction_percent: u32,
+    /// Using a summoned Ash's item summons it once more instead of
+    /// dismissing it (the same Ash several times; Dismiss all removes them).
+    pub repeat_same_ash: u8,
 }
 
 /// Starts the built-in Multiple Spirit Ashes once. `module` is NativeTweaks.dll
@@ -284,6 +293,7 @@ fn apply_hub_settings(hub: &NtMsaSettings) {
         current.patch_hud_movie = hub.hud_rows != 0;
         current.extra_cost_percent = hub.extra_cost_percent.min(1000);
         current.damage_reduction_percent = hub.damage_reduction_percent.min(100);
+        current.repeat_same_ash = hub.repeat_same_ash != 0;
     }
 }
 
@@ -841,7 +851,10 @@ unsafe extern "system" fn guarded_clear_owner_groups(
         // The same Ash again is a new summon when its previous instance has
         // died (user log: Tiche re-summoned while the active Ash was the dead
         // Tiche; the native clear removed the 5 other living Ashes).
-        && (request_effect != active_effect || !live_owner_has_effect(manager, owner_id, active_effect))
+        && (request_effect != active_effect
+            || !live_owner_has_effect(manager, owner_id, active_effect)
+            // Same Ash again: the living instance stays beside the new one.
+            || settings().repeat_same_ash)
         && requested_goods > 0
         && active_goods > 0
     {
@@ -882,11 +895,7 @@ fn clear_owner_group_exit_requests(
     owner_id: i32,
     except_effect: Option<i32>,
 ) -> usize {
-    let effect_by_buddy = manager
-        .trigger_speffect_to_buddy_map
-        .iter()
-        .filter_map(|(effect, buddy)| (*effect > 0).then_some((*buddy, *effect)))
-        .collect::<HashMap<_, _>>();
+    let effect_by_buddy = buddy_trigger_map(manager);
     let mut preserved_groups = 0usize;
 
     for entry in manager.groups.iter_mut() {
@@ -1122,7 +1131,7 @@ unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManage
 }
 
 fn live_owner_ash_count(manager: &SummonBuddyManager, owner_id: i32, cap: usize) -> usize {
-    let mut effects = [0i32; 256];
+    let mut effects = [0i32; 512];
     let mut count = 0usize;
     for entry in manager.groups.iter() {
         if entry.first != owner_id {
@@ -1151,11 +1160,50 @@ fn live_owner_ash_count(manager: &SummonBuddyManager, owner_id: i32, cap: usize)
     count
 }
 
+/// The trigger effect of the Ash summoned with this BuddyParam, at the
+/// upgrade level in use (see buddy_trigger_map).
 fn summon_effect_for_buddy(manager: &SummonBuddyManager, buddy_param_id: i32) -> Option<i32> {
+    if let Ok(in_use) = TRIGGER_IN_USE.lock() {
+        if let Some(effect) = in_use.get(&buddy_param_id) {
+            return Some(*effect);
+        }
+    }
     manager
         .trigger_speffect_to_buddy_map
         .iter()
         .find_map(|(effect, buddy)| (*effect > 0 && *buddy == buddy_param_id).then_some(*effect))
+}
+
+/// Living groups (spirits) of an Ash, every owner.
+fn live_group_count(manager: &SummonBuddyManager, effect: i32) -> usize {
+    manager
+        .groups
+        .iter()
+        .flat_map(|entry| entry.second.iter())
+        .filter(|group| {
+            chr_alive(unsafe { group.chr_ins.as_ref() })
+                && summon_effect_for_buddy(manager, group.buddy_param_id) == Some(effect)
+        })
+        .count()
+}
+
+/// Whether the guarded summon of `effect` is done: the Ash is living, and
+/// for the same Ash again, with more spirits than when it was armed.
+fn pending_switch_completed(
+    manager: &SummonBuddyManager,
+    effect: i32,
+    living_effects: &HashSet<i32>,
+    state: &RuntimeState,
+) -> bool {
+    if !living_effects.contains(&effect) {
+        return false;
+    }
+    match state.repeat_groups_before {
+        Some((baseline_effect, before)) if baseline_effect == effect => {
+            live_group_count(manager, effect) > before
+        }
+        _ => true,
+    }
 }
 
 fn live_owner_has_effect(
@@ -1193,7 +1241,7 @@ fn synchronize_pending_switch_goods(
     if pending_effect <= 0
         || pending_goods <= 0
         || active_effect != pending_effect
-        || !living_effects.contains(&pending_effect)
+        || !pending_switch_completed(manager, pending_effect, living_effects, state)
     {
         return;
     }
@@ -1208,6 +1256,7 @@ fn synchronize_pending_switch_goods(
     clear_pending_switch_markers(pending_effect);
     state.pending_switch_request_effect = None;
     state.pending_switch_request_goods = None;
+    state.repeat_groups_before = None;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1225,6 +1274,9 @@ struct RuntimeState {
     pending_requested_effect: Option<i32>,
     pending_switch_request_effect: Option<i32>,
     pending_switch_request_goods: Option<i32>,
+    /// Same Ash again: the Ash being summoned once more and its living
+    /// spirits when the guard was armed.
+    repeat_groups_before: Option<(i32, usize)>,
     previous_live_effects: HashSet<i32>,
     dismissed_effects: HashSet<i32>,
     dismissal_fade_backups: HashMap<usize, DismissalFadeBackup>,
@@ -1375,6 +1427,8 @@ fn spirit_ash_task(_: &FD4TaskData) {
         extras::release_dead_groups(manager);
     }
     extras::update_buddy_stone_rules();
+    extras::apply_stone_fallback(manager);
+    extras::log_ash_bodies(manager, world.summon_buddy_chr_set.capacity);
     extras::update_damage_by_count(manager, &buddy_to_trigger, &all_live_effects);
     if settings().follow_areas {
         update_area_follow(manager, &buddy_to_trigger, &state.dismissed_effects, player_position);
@@ -1419,7 +1473,7 @@ fn spirit_ash_task(_: &FD4TaskData) {
         state.last_request_effect = request_effect;
         if request_effect > 0 {
             let living_effects = collect_all_live_effects(manager, &buddy_to_trigger);
-            if living_effects.contains(&request_effect) {
+            if living_effects.contains(&request_effect) && !settings().repeat_same_ash {
                 if !manager.disappear_requested {
                     log_line(format_args!(
                         "item dismissal deferred: source=post_physics effect={} reason=awaiting_confirmation",
@@ -1468,12 +1522,12 @@ fn spirit_ash_task(_: &FD4TaskData) {
         let all_live_before_action = collect_all_live_effects(manager, &buddy_to_trigger);
         let requested_action = (request_changed && request_effect > 0)
             .then(|| {
-                (!all_live_before_action.contains(&request_effect))
+                (settings().repeat_same_ash || !all_live_before_action.contains(&request_effect))
                     .then(|| {
                         classify_item_action(
                             request_effect,
                             &all_live_before_action,
-                            settings().toggle_dismiss,
+                            settings().toggle_dismiss && !settings().repeat_same_ash,
                         )
                     })
                     .flatten()
@@ -2097,6 +2151,7 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
     }
 
     let manager = unsafe { &mut *manager_ptr };
+    extras::apply_stone_fallback(manager);
     let buddy_to_trigger = buddy_trigger_map(manager);
     let all_live_effects = collect_all_live_effects(manager, &buddy_to_trigger);
     let active_effect = i32::try_from(manager.active_summon_speffect_id).unwrap_or(0);
@@ -2173,7 +2228,7 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
         }
         let request_changed = request_effect > 0 && previous_request != request_effect as isize;
         if request_changed {
-            if all_live_effects.contains(&request_effect) {
+            if all_live_effects.contains(&request_effect) && !settings().repeat_same_ash {
                 if settings().toggle_dismiss
                     && settings().suppress_spirit_ash_confirmation
                     && !manager.disappear_requested
@@ -2253,7 +2308,7 @@ fn forward_pending_switch_request(
         let pending_goods = state.pending_switch_request_goods.unwrap_or(-1);
         let completed = active_effect == pending_effect
             && active_goods == pending_goods
-            && living_effects.contains(&pending_effect);
+            && pending_switch_completed(manager, pending_effect, living_effects, state);
         let cancelled_or_replaced = (requested_goods != pending_goods && requested_goods > 0)
             || (manager.request_summon_speffect_id > 0
                 && manager.request_summon_speffect_id != pending_effect);
@@ -2261,6 +2316,7 @@ fn forward_pending_switch_request(
             clear_pending_switch_markers(pending_effect);
             state.pending_switch_request_effect = None;
             state.pending_switch_request_goods = None;
+            state.repeat_groups_before = None;
         } else {
             return;
         }
@@ -2323,12 +2379,15 @@ fn arm_direct_summon_guard(
     // active one: when the active Ash has just died (Godrick's arena, user
     // log: active 204000 at HP 0) or was dismissed with its item, the native
     // owner-wide clear used to remove every other living Ash.
-    let others_alive = living_effects
-        .iter()
-        .any(|effect| *effect != target_effect && !state.dismissed_effects.contains(effect));
+    // Same Ash again: its own living instance must survive too.
+    let repeat = settings().repeat_same_ash && living_effects.contains(&target_effect);
+    let others_alive = repeat
+        || living_effects
+            .iter()
+            .any(|effect| *effect != target_effect && !state.dismissed_effects.contains(effect));
     if !NATIVE_CLEAR_GUARD_READY.load(Ordering::Acquire)
         || target_effect <= 0
-        || living_effects.contains(&target_effect)
+        || (living_effects.contains(&target_effect) && !repeat)
         || active_effect <= 0
         || !others_alive
         || requested_goods <= 0
@@ -2346,15 +2405,17 @@ fn arm_direct_summon_guard(
     PENDING_SWITCH_CLEAR_EFFECT.store(target_effect as isize, Ordering::Release);
     state.pending_switch_request_effect = Some(target_effect);
     state.pending_switch_request_goods = Some(requested_goods);
+    state.repeat_groups_before = repeat.then(|| (target_effect, live_group_count(manager, target_effect)));
     log_line(format_args!(
-        "direct summon guard armed: source={} effect={} goods={} active_effect={} active_goods={} existing_ashes={} cap={}",
+        "direct summon guard armed: source={} effect={} goods={} active_effect={} active_goods={} existing_ashes={} cap={} same_ash_again={}",
         source,
         target_effect,
         requested_goods,
         active_effect,
         manager.active_summon_goods_id,
         living_effects.len(),
-        cap
+        cap,
+        repeat
     ));
 }
 
@@ -2496,7 +2557,8 @@ fn record_dismissal_target(
         return;
     }
 
-    if currently_living.contains(&requested_effect) {
+    // Same Ash again: a living Ash's item summons another, the living one stays.
+    if currently_living.contains(&requested_effect) && !settings().repeat_same_ash {
         if dismissed_effects.insert(requested_effect) {
             log_line(format_args!(
                 "dismiss target tracked: effect={} already_living=true",
@@ -3617,15 +3679,58 @@ fn apply_item_action(
     }
 }
 
-fn buddy_trigger_map(manager: &SummonBuddyManager) -> HashMap<i32, i32> {
+/// BuddyParam -> the trigger SpEffect of the spirit ash summoned with it.
+///
+/// Every upgrade level has its own item and trigger effect (Finlay +0 223000
+/// ... +10 223010, identical SpEffectParam rows) but they share one BuddyParam
+/// whose triggerSpEffectId is the +0 effect, the only one in the game's map;
+/// the level is applied through dopingSpEffect_lv0-10. Reading the map alone
+/// made a +10 Ash look like its +0: the active effect (223010) never matched
+/// its living group, so using the item of a summoned Ash summoned it again
+/// instead of dismissing it (r140 test log: Finlay x3), and several-ash
+/// checks failed (Nexus report at +10). The level in use is the effect the
+/// game reports as active or requested, matched to its +0 entry (the same
+/// effect or up to 10 below it) and remembered per BuddyParam.
+pub(crate) fn buddy_trigger_map(manager: &SummonBuddyManager) -> HashMap<i32, i32> {
     let mut mapping = HashMap::with_capacity(manager.trigger_speffect_to_buddy_map.len());
+    let mut buddy_of = HashMap::with_capacity(manager.trigger_speffect_to_buddy_map.len());
     for (trigger_effect, buddy_param_id) in manager.trigger_speffect_to_buddy_map.iter() {
         if *trigger_effect > 0 && *buddy_param_id > 0 {
             mapping.entry(*buddy_param_id).or_insert(*trigger_effect);
+            buddy_of.insert(*trigger_effect, *buddy_param_id);
+        }
+    }
+    let Ok(mut in_use) = TRIGGER_IN_USE.lock() else {
+        return mapping;
+    };
+    let active = i32::try_from(manager.active_summon_speffect_id).unwrap_or(0);
+    for effect in [active, manager.request_summon_speffect_id] {
+        if let Some((buddy, _)) = upgrade_base(&buddy_of, effect) {
+            in_use.insert(buddy, effect);
+        }
+    }
+    for (buddy, effect) in in_use.iter() {
+        if upgrade_base(&buddy_of, *effect).map(|(found, _)| found) == Some(*buddy) {
+            mapping.insert(*buddy, *effect);
         }
     }
     mapping
 }
+
+/// The BuddyParam and +0 trigger effect of an Ash's trigger effect at any
+/// upgrade level: the effect itself when the game's map has it, else the
+/// first one up to 10 below it that the map has (levels +1 to +10).
+fn upgrade_base(buddy_of: &HashMap<i32, i32>, effect: i32) -> Option<(i32, i32)> {
+    if effect <= 0 {
+        return None;
+    }
+    (0..=MAX_UPGRADE_LEVEL).find_map(|level| {
+        let base = effect.checked_sub(level)?;
+        buddy_of.get(&base).map(|buddy| (*buddy, base))
+    })
+}
+
+const MAX_UPGRADE_LEVEL: i32 = 10;
 
 fn collect_live_effects(
     manager: &SummonBuddyManager,
@@ -3682,6 +3787,8 @@ struct Settings {
     damage_reduction_percent: u32,
     max_active_ashes: usize,
     toggle_dismiss: bool,
+    /// See NtMsaSettings::repeat_same_ash.
+    repeat_same_ash: bool,
     patch_buddy_item_limits: bool,
     suppress_spirit_ash_confirmation: bool,
     suppress_additional_summon_prompt: bool,
@@ -3704,6 +3811,7 @@ impl Settings {
         damage_reduction_percent: 0,
         max_active_ashes: 8,
         toggle_dismiss: true,
+        repeat_same_ash: false,
         patch_buddy_item_limits: true,
         suppress_spirit_ash_confirmation: false,
         suppress_additional_summon_prompt: true,
@@ -3781,6 +3889,19 @@ mod tests {
     }
 
     #[test]
+    fn upgraded_ashes_resolve_to_their_base_entry() {
+        // The game's map holds only +0 trigger effects (Finlay 223000, Jellyfish
+        // 200000); upgraded items use +1..+10 (223010 = Finlay +10).
+        let buddy_of = HashMap::from([(223000, 22300000), (200000, 20000000), (201000, 20100000)]);
+        assert_eq!(upgrade_base(&buddy_of, 223000), Some((22300000, 223000)));
+        assert_eq!(upgrade_base(&buddy_of, 223010), Some((22300000, 223000)));
+        assert_eq!(upgrade_base(&buddy_of, 200003), Some((20000000, 200000)));
+        assert_eq!(upgrade_base(&buddy_of, 200011), None);
+        assert_eq!(upgrade_base(&buddy_of, 201000), Some((20100000, 201000)));
+        assert_eq!(upgrade_base(&buddy_of, -1), None);
+    }
+
+    #[test]
     fn a_new_ash_preserves_existing_ashes() {
         assert_eq!(
             classify_item_action(200, &effects(&[100]), true),
@@ -3833,6 +3954,7 @@ mod tests {
             hud_rows: 1,
             extra_cost_percent: 50,
             damage_reduction_percent: 10,
+            repeat_same_ash: 0,
         });
         let applied = settings();
         assert!(applied.enabled);
@@ -3854,6 +3976,7 @@ mod tests {
             hud_rows: 0,
             extra_cost_percent: 100,
             damage_reduction_percent: 0,
+            repeat_same_ash: 0,
         });
         let off = settings();
         assert!(!off.enabled);
