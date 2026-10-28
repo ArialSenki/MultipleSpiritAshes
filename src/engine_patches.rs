@@ -1,9 +1,11 @@
 //! Game patches that NativeTweaks applies from its Hub (src/vanilla_settings.cpp,
 //! where each one is explained) and the standalone DLL applies here, once,
 //! from its INI:
-//! - up to 500 spirits: the summon_buddy ChrSet is created with 520 entries
-//!   instead of 80, and the slot search runs over all of them from slot 20
-//!   instead of the 10 slots of the player's own block;
+//! - up to 500 spirits: the summon_buddy ChrSet gets 520 entries instead of
+//!   80 (a hook on the epilogue of the function that creates it; its body is
+//!   left as it is for Seamless Co-op, which looks for those bytes), and the
+//!   slot search runs over all of them from slot 20 instead of the 10 slots of
+//!   the player's own block;
 //! - Summon anywhere: the summoning-area state check, the item's area check and
 //!   "within activation range" all pass.
 //! Every site is found by its bytes in the game's code and left alone when it
@@ -75,8 +77,14 @@ fn patch(code: &(usize, &[u8]), label: &str, pattern: &str, offset: usize, expec
     native_prompt::write_executable_patch(address, bytes, label)
 }
 
-const BUDDY_SET_INIT: &str = "ba 00 05 00 00 41 b8 08 00 00 00 ff 50 50 48 89 46 18 48 85 c0 74 ? \
-    bf 50 00 00 00 89 7e 10 33 d2 41 b8 00 05 00 00";
+/// From "mov rcx,[allocator]" to the function's ret; the hook goes on the
+/// epilogue.
+const BUDDY_SET_INIT: &str = "48 8b 0d ? ? ? ? 48 8b 01 ba 00 05 00 00 41 b8 08 00 00 00 ff 50 50 48 89 46 18 \
+    48 85 c0 74 ? bf 50 00 00 00 89 7e 10 33 d2 41 b8 00 05 00 00 48 8b c8 e8 ? ? ? ? 33 db \
+    66 66 66 0f 1f 84 00 00 00 00 00 48 8b 4e 18 48 03 cb 48 89 4c 24 58 48 89 4c 24 60 74 08 33 d2 \
+    e8 ? ? ? ? 90 48 83 c3 10 48 83 ef 01 75 db 48 83 c4 30 5f 5e 5b c3";
+const BUDDY_SET_EPILOGUE: usize = 0x6b;
+const BUDDY_SET_ENTRIES: u32 = 520;
 const SLOT_START: &str = "0f b6 c2 83 c0 02 8d 04 80 44 8d 14 00 b8 67 66 66 66 41 f7 e9";
 const SLOT_LOOP: [u8; 57] = [
     0x41, 0x83, 0xf9, 0x0a, 0x7d, 0x0a, 0x43, 0x8d, 0x3c, 0x11, 0x49, 0x8d, 0x1c, 0x12, 0xeb, 0x0e,
@@ -85,27 +93,71 @@ const SLOT_LOOP: [u8; 57] = [
     0x48, 0xff, 0xc1, 0x48, 0x83, 0xf9, 0x0a, 0x7c, 0xc7,
 ];
 
-/// The spirit set's size (it is created once, early: patched as soon as the
-/// DLL starts) and the slot search over the whole set.
-fn spirit_slots(code: &(usize, &[u8])) {
+/// The spirit set's size: it is created once, early, so the hook goes in as
+/// soon as the DLL starts. On the epilogue rsi = the new ChrSet with its 80
+/// entries built; the cave allocates 520 zeroed entries (what the entry
+/// constructor leaves) through the same game allocator and frees the 80, so
+/// the game frees the larger array itself. A set somebody else already
+/// resized (not 80 entries) is left alone.
+fn spirit_set_size(code: &(usize, &[u8])) -> bool {
     let Some(init) = find_unique(code, BUDDY_SET_INIT) else {
-        log_line("spirit set: allocation code not found (or ambiguous); left at 80 entries");
-        return;
+        log_line("spirit set: creation code not found (or ambiguous); left at 80 entries");
+        return false;
     };
-    // 520 entries of 16 bytes, written together once all three were checked.
-    let writes: [(usize, &[u8], &[u8]); 3] = [
-        (0, &[0xba, 0x00, 0x05, 0x00, 0x00], &[0xba, 0x80, 0x20, 0x00, 0x00]),
-        (0x17, &[0xbf, 0x50, 0x00, 0x00, 0x00], &[0xbf, 0x08, 0x02, 0x00, 0x00]),
-        (0x21, &[0x41, 0xb8, 0x00, 0x05, 0x00, 0x00], &[0x41, 0xb8, 0x80, 0x20, 0x00, 0x00]),
-    ];
-    let set_ok = writes.iter().all(|(offset, expected, _)| {
-        (unsafe { std::slice::from_raw_parts((init + offset) as *const u8, expected.len()) }) == *expected
-    }) && writes
-        .iter()
-        .all(|(offset, _, bytes)| native_prompt::write_executable_patch(init + offset, bytes, "spirit set"));
+    let site = init + BUDDY_SET_EPILOGUE;
+    let displacement = unsafe { ((init + 3) as *const i32).read_unaligned() };
+    let allocator = ((init + 7) as i64 + displacement as i64) as u64;
+    let Some(cave) = (unsafe { allocate_near(site) }).map(|page| page as usize) else {
+        log_line("spirit set: no memory near the game code; left at 80 entries");
+        return false;
+    };
+    let bytes = BUDDY_SET_ENTRIES * 16;
+    let mut body: Vec<u8> = vec![0x83, 0x7e, 0x10, 0x50, 0x75, 0x00]; // cmp dword [rsi+10h],80; jne done
+    let mut to_done = vec![body.len()];
+    body.extend_from_slice(&[0x48, 0x83, 0x7e, 0x18, 0x00, 0x74, 0x00]); // cmp qword [rsi+18h],0; je done
+    to_done.push(body.len());
+    body.extend_from_slice(&[0x48, 0xb9]); // mov rcx,&allocator
+    body.extend_from_slice(&allocator.to_le_bytes());
+    body.extend_from_slice(&[0x48, 0x8b, 0x09, 0x48, 0x8b, 0x01, 0xba]); // mov rcx,[rcx]; mov rax,[rcx]; mov edx,
+    body.extend_from_slice(&bytes.to_le_bytes());
+    body.extend_from_slice(&[
+        0x41, 0xb8, 0x08, 0x00, 0x00, 0x00, // mov r8d,8
+        0xff, 0x50, 0x50, // call [rax+50h]      allocate
+        0x48, 0x85, 0xc0, 0x74, 0x00, // test rax,rax; je done
+    ]);
+    to_done.push(body.len());
+    // mov rbx,rax; mov rdi,rax; xor eax,eax; mov ecx,
+    body.extend_from_slice(&[0x48, 0x89, 0xc3, 0x48, 0x89, 0xc7, 0x31, 0xc0, 0xb9]);
+    body.extend_from_slice(&(bytes / 8).to_le_bytes());
+    body.extend_from_slice(&[
+        0xf3, 0x48, 0xab, // rep stosq           zeroed entries
+        0x48, 0x8b, 0x56, 0x18, // mov rdx,[rsi+18h]   the 80
+        0x48, 0x89, 0x5e, 0x18, // mov [rsi+18h],rbx
+        0xc7, 0x46, 0x10, // mov dword [rsi+10h],
+    ]);
+    body.extend_from_slice(&BUDDY_SET_ENTRIES.to_le_bytes());
+    body.extend_from_slice(&[0x48, 0xb9]); // mov rcx,&allocator
+    body.extend_from_slice(&allocator.to_le_bytes());
+    // mov rcx,[rcx]; mov rax,[rcx]; call [rax+68h]   free
+    body.extend_from_slice(&[0x48, 0x8b, 0x09, 0x48, 0x8b, 0x01, 0xff, 0x50, 0x68]);
+    for at in to_done {
+        body[at - 1] = (body.len() - at) as u8;
+    }
+    body.extend_from_slice(&[0x48, 0x83, 0xc4, 0x30, 0x5f, 0x5e, 0x5b, 0xc3]); // done: the epilogue
+    unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), cave as *mut u8, body.len()) };
+
+    let mut jump = [0xccu8; 8];
+    jump[0] = 0xe9;
+    jump[1..5].copy_from_slice(&((cave as i64 - (site as i64 + 5)) as i32).to_le_bytes());
+    native_prompt::write_executable_patch(site, &jump, "spirit set")
+}
+
+/// The spirit set's size and the slot search over the whole set.
+fn spirit_slots(code: &(usize, &[u8])) {
+    let set_ok = spirit_set_size(code);
     log_line(format_args!(
-        "spirit set: created with {} entries",
-        if set_ok { 520 } else { 80 }
+        "spirit set: {} entries when the game creates it",
+        if set_ok { BUDDY_SET_ENTRIES } else { 80 }
     ));
 
     // The search: start at 20 for everyone, then a cave that runs over every

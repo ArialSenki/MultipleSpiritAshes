@@ -1,4 +1,4 @@
-# Multiple Spirit Ashes 0.2.2
+# Multiple Spirit Ashes 0.2.3
 
 For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
 
@@ -55,6 +55,14 @@ external_dlls = [
 ### Elden Mod Loader (not tested)
 
 With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config.ini`), copy `MultipleSpiritAshes.dll` and `MultipleSpiritAshes.ini` into `Game\mods\`. Set `load_delay` in `mod_loader_config.ini` to a low value (e.g. `0`): the HUD rows are prepared when the game first loads its HUD.
+
+## Changes in 0.2.3
+
+Fixed:
+
+- Seamless Co-op no longer stops at launch with "No such pattern" while this mod is loaded: the patch that makes room for 500 spirits now leaves the bytes Seamless Co-op looks for untouched.
+
+Update: replace the DLL; the INI is unchanged from 0.2.2 (keep yours).
 
 ## Changes in 0.2.2
 

@@ -1,4 +1,6 @@
 mod area_follow;
+mod clean;
+mod deflect;
 mod engine_patches;
 mod extras;
 mod game_menus;
@@ -40,6 +42,8 @@ use area_follow::update_area_follow;
 pub use extras::{nt_msa_dismiss_all, nt_msa_set_ash_cost_percent, nt_msa_set_buddy_stone_rules};
 pub use engine_patches::nt_msa_engine_patches;
 pub use game_menus::{nt_game_menu_last_result, nt_open_game_menu};
+pub use deflect::nt_set_deflect_window;
+pub use clean::nt_set_player_clean;
 use native_prompt::*;
 use pelite::pe64::Pe;
 use windows::core::PCWSTR;
@@ -58,7 +62,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "0.2.2-ww2710-ww2720";
+const BUILD_VERSION: &str = "0.2.3-ww2710-ww2720";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
