@@ -13,7 +13,7 @@ use std::{
 
 use multiple_spirit_ashes::{
     NtMsaSettings, nt_msa_dismiss_all, nt_msa_engine_patches, nt_msa_set_ash_cost_percent,
-    nt_msa_set_buddy_stone_rules, nt_msa_start,
+    nt_msa_set_buddy_stone_rules, nt_msa_set_solid_ashes, nt_msa_start,
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, HMODULE},
@@ -50,6 +50,7 @@ struct Config {
     keep_ashes_after_boss: bool,
     resummon_without_rest: bool,
     repeat_same_ash: bool,
+    solid_ashes: bool,
     dismiss_all_key: Option<i32>,
     log_enabled: bool,
 }
@@ -67,6 +68,7 @@ impl Default for Config {
             keep_ashes_after_boss: true,
             resummon_without_rest: true,
             repeat_same_ash: false,
+            solid_ashes: false,
             dismiss_all_key: None,
             log_enabled: false,
         }
@@ -105,6 +107,7 @@ fn run(module: isize) {
     // Up to 500 spirits and Summon anywhere in every area: game code patches,
     // applied once (NativeTweaks applies the same ones from its Hub).
     nt_msa_engine_patches(u8::from(config.enabled), u8::from(config.summon_anywhere));
+    nt_msa_set_solid_ashes(u8::from(config.solid_ashes));
     let Some(key) = config.dismiss_all_key else {
         return;
     };
@@ -187,6 +190,7 @@ fn parse_config(text: &str) -> Config {
             "repeatsameash" => {
                 config.repeat_same_ash = parse_bool(value).unwrap_or(config.repeat_same_ash)
             }
+            "solidashes" => config.solid_ashes = parse_bool(value).unwrap_or(config.solid_ashes),
             "dismissallkey" => config.dismiss_all_key = parse_key(value),
             "logenabled" => config.log_enabled = parse_bool(value).unwrap_or(config.log_enabled),
             _ => {}
@@ -231,7 +235,7 @@ mod tests {
         let config = parse_config(
             "[MultipleSpiritAshes]\nEnabled=true\nMaxActiveAshes=50\nAshCostPercent=400\nExtraAshCostPercent=50\n\
              DamageLossPerExtraAshPercent=99\nHudRows=false\nSummonAnywhere=no\n\
-             KeepAshesAfterBoss=yes\nResummonWithoutRest=on\nDismissAllKey=F5\nLogEnabled=1\n",
+             KeepAshesAfterBoss=yes\nResummonWithoutRest=on\nSolidAshes=true\nDismissAllKey=F5\nLogEnabled=1\n",
         );
         assert!(config.enabled);
         assert_eq!(config.max_active_ashes, 50);
@@ -242,6 +246,7 @@ mod tests {
         assert!(!config.summon_anywhere);
         assert!(config.keep_ashes_after_boss);
         assert!(config.resummon_without_rest);
+        assert!(config.solid_ashes);
         assert_eq!(config.dismiss_all_key, Some(0x74));
         assert!(config.log_enabled);
     }

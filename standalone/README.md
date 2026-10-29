@@ -1,4 +1,4 @@
-# Multiple Spirit Ashes 0.2.3
+# Multiple Spirit Ashes 0.2.4
 
 For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
 
@@ -12,6 +12,7 @@ For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.
 - **Balance:** cost of every ash, cost of each extra ash, and damage lost per extra ash.
 - **HUD:** one compact row per ash with its name and HP (up to 7; "xN" for groups, "+N" when there are more), in place of the single spirit panel.
 - **Dismiss all:** an optional key dismisses every summoned ash.
+- **Solid ashes:** with `SolidAshes=true` summoned ashes look like normal characters instead of the blue ghost look (off by default).
 
 Everything is set in `MultipleSpiritAshes.ini` (comments explain each line). Changes apply when the game starts; the monument rules apply after the area reloads (rest at a grace).
 
@@ -55,6 +56,14 @@ external_dlls = [
 ### Elden Mod Loader (not tested)
 
 With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config.ini`), copy `MultipleSpiritAshes.dll` and `MultipleSpiritAshes.ini` into `Game\mods\`. Set `load_delay` in `mod_loader_config.ini` to a low value (e.g. `0`): the HUD rows are prepared when the game first loads its HUD.
+
+## Changes in 0.2.4
+
+New:
+
+- `SolidAshes` (off by default): summoned ashes look solid, like normal characters, instead of the blue ghost look (Nexus request; also in NativeTweaks as Solid spirit ashes).
+
+Update: replace the DLL and add the new `SolidAshes` line to your INI (or take the new INI); without the line the ashes keep their ghost look.
 
 ## Changes in 0.2.3
 

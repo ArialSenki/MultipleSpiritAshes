@@ -4,6 +4,8 @@
 //! in WW 2.7.1.0 and 2.7.2.0:
 //!  - 81(1) -> menu type 30 (CharaMakeMenu); 81(0) opens type 16 (CharaMakeMenu2),
 //!    which looked the same in the in-game test, so only 81(1) is used;
+//!  - 31() -> menu type 10, the level-up screen Melina opens at a grace
+//!    (OpenSoul; same id as in soulstruct's talk command list);
 //!  - 113() -> menu type 19 (ReallocateAttributes), Rennala's rebirth. The
 //!    Larval Tear is checked and taken by her talk script, not by the command,
 //!    so the screen opens for free.
@@ -16,8 +18,10 @@ use eldenring::{
 };
 
 pub const GAME_MENU_MIRROR: i32 = 1;
+pub const GAME_MENU_LEVEL_UP: i32 = 2;
 pub const GAME_MENU_REBIRTH: i32 = 3;
 
+const OPEN_SOUL: i32 = 31;
 const OPEN_CHARA_MAKE_MENU: i32 = 81;
 const OPEN_REALLOCATE_ATTRIBUTES: i32 = 113;
 /// Any talk id: the commands above don't read it.
@@ -42,7 +46,7 @@ static OPENER: Mutex<Opener> = Mutex::new(Opener(None));
 /// for an unknown kind or when the game's task scheduler isn't there yet.
 #[unsafe(no_mangle)]
 pub extern "C" fn nt_open_game_menu(kind: i32) -> u8 {
-    if kind != GAME_MENU_MIRROR && kind != GAME_MENU_REBIRTH {
+    if kind != GAME_MENU_MIRROR && kind != GAME_MENU_LEVEL_UP && kind != GAME_MENU_REBIRTH {
         return 0;
     }
     // The talk-script vtables come from the bindings' address tables.
@@ -100,6 +104,7 @@ fn open_game_menu(kind: i32) {
     script.npc_talk.base.field_ins_handle = handle;
     let result = match kind {
         GAME_MENU_MIRROR => script.event((OPEN_CHARA_MAKE_MENU, [EzStateValue::Int32(1)])),
+        GAME_MENU_LEVEL_UP => script.event(OPEN_SOUL),
         GAME_MENU_REBIRTH => script.event(OPEN_REALLOCATE_ATTRIBUTES),
         _ => return,
     };

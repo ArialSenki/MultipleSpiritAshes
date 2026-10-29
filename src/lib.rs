@@ -6,8 +6,10 @@ mod extras;
 mod game_menus;
 mod hud;
 mod hud_movie;
+mod melina;
 mod native_prompt;
 mod perf;
+mod solid;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -44,6 +46,8 @@ pub use engine_patches::nt_msa_engine_patches;
 pub use game_menus::{nt_game_menu_last_result, nt_open_game_menu};
 pub use deflect::nt_set_deflect_window;
 pub use clean::nt_set_player_clean;
+pub use solid::nt_msa_set_solid_ashes;
+pub use melina::{nt_set_melina_companion, nt_summon_melina};
 use native_prompt::*;
 use pelite::pe64::Pe;
 use windows::core::PCWSTR;
@@ -62,7 +66,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "0.2.3-ww2710-ww2720";
+const BUILD_VERSION: &str = "0.2.4-ww2710-ww2720";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
