@@ -63,6 +63,10 @@ Swarte and contributors, with address tables added for 2.7.2.0 and 2.7.2.1.
 It keeps its own MIT / Apache-2.0 licenses. The rest of the dependencies come
 from crates.io; see [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
 
+## Downloads and changelog
+
+The latest build is also on the [Releases](https://github.com/ArialSenki/MultipleSpiritAshes/releases/latest) page. [CHANGELOG.md](CHANGELOG.md) lists every version, as on Nexus.
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
