@@ -1,4 +1,4 @@
-# Multiple Spirit Ashes 0.2.5
+# Multiple Spirit Ashes
 
 For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
 
@@ -57,63 +57,12 @@ external_dlls = [
 
 With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config.ini`), copy `MultipleSpiritAshes.dll` and `MultipleSpiritAshes.ini` into `Game\mods\`. Set `load_delay` in `mod_loader_config.ini` to a low value (e.g. `0`): the HUD rows are prepared when the game first loads its HUD.
 
-## Changes in 0.2.5
-
-Fixed:
-
-- `SummonAnywhere`, `KeepAshesAfterBoss` and `ResummonWithoutRest` did nothing while `Enabled=false`. With several ashes at once turned off, a spirit ash could not be summoned away from a monument (Roundtable Hold, Radahn's battlefield), even with `SummonAnywhere=true`, because the monument rules were only applied while `Enabled=true`. They now work on their own: `Enabled=false` gives one ash at a time, as in the game, and the three monument rules still apply as set. Nexus report (the same fix is in NativeTweaks r144).
-
-Update: replace the DLL. The INI only rewords the comment on `Enabled`, so you can keep yours.
-
-## Changes in 0.2.4
-
-New:
-
-- `SolidAshes` (off by default): summoned ashes look solid, like normal characters, instead of the blue ghost look (Nexus request; also in NativeTweaks as Solid spirit ashes).
-
-Update: replace the DLL and add the new `SolidAshes` line to your INI (or take the new INI); without the line the ashes keep their ghost look.
-
-## Changes in 0.2.3
-
-Fixed:
-
-- Seamless Co-op no longer stops at launch with "No such pattern" while this mod is loaded: the patch that makes room for 500 spirits now leaves the bytes Seamless Co-op looks for untouched.
-
-Update: replace the DLL; the INI is unchanged from 0.2.2 (keep yours).
-
-## Changes in 0.2.2
-
-Fixed:
-
-- Upgraded spirit ashes (+1 to +10) work with several ashes at once: they can be summoned beside others, and their item dismisses only that ash instead of summoning it again.
-- Summon anywhere works in every area of the game and the DLC, boss arenas included (Radahn's battlefield). Before, summoning was refused away from a monument, and an ash summoned there could stand frozen, could not be touched and kept playing its summoning sound. A refused summon also stayed queued and came out later in place of the ash you chose.
-- After all your ashes die you can summon again at once; before, summoning stayed blocked until you rested.
-- Summons past 10 spirits no longer spend the FP for nothing: the game keeps 10 spirits per player, so with several ashes out a summon showed only part of its spirits or none (Lone Wolf Ashes: 1 wolf of 3).
-
-Changed:
-
-- Up to 500 spirits at once, and no ash limit by default (`MaxActiveAshes=0`).
-- The HUD shows 7 ash rows (was 6).
-
-New:
-
-- `RepeatSameAsh` (off by default): using a summoned ash's item summons it once more instead of dismissing it.
-
-Update: replace the DLL and the INI (new and changed lines).
-
-## Changes in 0.2.1
-
-Fixes from long boss fights (Godrick):
-
-- Summoning a new ash right after the current one died no longer dismisses every other living ash, and neither does summoning the same ash again after it died.
-- Using an ash's item could be taken as dismissing another living ash, so the summoning animation played but nobody came. Items are now matched to their ash by the game's own item data.
-- Fallen ashes are released two seconds after they die; they used to pile up until no new summon worked.
-
 ## Notes
 
+- Seamless Co-op: the game starts with this mod, but several ashes at once has not been tested in co-op. Use the Compatibility file there, and please report how it goes.
 - The DLL checks the game version and the code it changes before touching anything; on other versions it does nothing.
 - No game files are shipped: the HUD changes are applied in memory, on top of whichever HUD file is loaded.
-- Updating from 0.1.56: replace the DLL and the INI (the INI keys changed).
+- Updating: replace the DLL; your INI can stay. From a much older version, replace the INI too.
 
 ## Credits
 

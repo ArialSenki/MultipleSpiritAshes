@@ -66,7 +66,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "0.2.5-ww2710-ww2720";
+const BUILD_VERSION: &str = "1.0.0-ww2710-ww2720";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
@@ -2146,11 +2146,17 @@ fn clear_active_buddy_stone_link(
 /// (Roundtable Hold, 31-10 test). The standalone DLL's monument rules
 /// (SummonAnywhere, KeepAshesAfterBoss, ResummonWithoutRest) are applied here
 /// too, so they work with Enabled=false; the Hub sets none (no-op there).
+/// Only once there is a player: these tasks run from the first frames, before
+/// the game has its params, and reading them then panics (0.2.5 closed the game
+/// at start with Enabled=false).
 fn stone_fallback_only() {
-    extras::update_buddy_stone_rules();
     let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
         return;
     };
+    if world.main_player.is_none() {
+        return;
+    }
+    extras::update_buddy_stone_rules();
     let player_alive = world
         .main_player
         .as_ref()
