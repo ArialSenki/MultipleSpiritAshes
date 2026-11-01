@@ -66,7 +66,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "0.2.4-ww2710-ww2720";
+const BUILD_VERSION: &str = "0.2.5-ww2710-ww2720";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
@@ -1380,6 +1380,7 @@ fn timed_hud_task(data: &FD4TaskData) {
 fn spirit_ash_task(_: &FD4TaskData) {
     if !settings().enabled {
         restore_native_rows_when_off();
+        stone_fallback_only();
         return;
     }
 
@@ -2138,8 +2139,30 @@ fn clear_active_buddy_stone_link(
     }
 }
 
+/// Summon anywhere is its own option (Nexus, megamuni): with several ashes
+/// off both tasks still put the monument fallback in. The early one matters
+/// most: the game clears the monument every frame and checks it when an item
+/// is used, so without it nothing could be summoned where no monument is near
+/// (Roundtable Hold, 31-10 test). The standalone DLL's monument rules
+/// (SummonAnywhere, KeepAshesAfterBoss, ResummonWithoutRest) are applied here
+/// too, so they work with Enabled=false; the Hub sets none (no-op there).
+fn stone_fallback_only() {
+    extras::update_buddy_stone_rules();
+    let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return;
+    };
+    let player_alive = world
+        .main_player
+        .as_ref()
+        .is_some_and(|player| !chr_dead(&player.chr_ins));
+    if let (true, Some(manager_ptr)) = (player_alive, summon_buddy_manager_ptr(world)) {
+        extras::apply_stone_fallback(unsafe { &mut *manager_ptr });
+    }
+}
+
 fn allow_additional_ashes_task(data: &FD4TaskData) {
     if !settings().enabled {
+        stone_fallback_only();
         return;
     }
 

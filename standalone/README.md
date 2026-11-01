@@ -1,4 +1,4 @@
-# Multiple Spirit Ashes 0.2.4
+# Multiple Spirit Ashes 0.2.5
 
 For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
 
@@ -56,6 +56,14 @@ external_dlls = [
 ### Elden Mod Loader (not tested)
 
 With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config.ini`), copy `MultipleSpiritAshes.dll` and `MultipleSpiritAshes.ini` into `Game\mods\`. Set `load_delay` in `mod_loader_config.ini` to a low value (e.g. `0`): the HUD rows are prepared when the game first loads its HUD.
+
+## Changes in 0.2.5
+
+Fixed:
+
+- `SummonAnywhere`, `KeepAshesAfterBoss` and `ResummonWithoutRest` did nothing while `Enabled=false`. With several ashes at once turned off, a spirit ash could not be summoned away from a monument (Roundtable Hold, Radahn's battlefield), even with `SummonAnywhere=true`, because the monument rules were only applied while `Enabled=true`. They now work on their own: `Enabled=false` gives one ash at a time, as in the game, and the three monument rules still apply as set. Nexus report (the same fix is in NativeTweaks r144).
+
+Update: replace the DLL. The INI only rewords the comment on `Enabled`, so you can keep yours.
 
 ## Changes in 0.2.4
 
