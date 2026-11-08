@@ -13,7 +13,11 @@ For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.
 - **HUD:** one compact row per ash with its name and HP (up to 7; "xN" for groups, "+N" when there are more), in place of the single spirit panel.
 - **Dismiss all:** an optional key dismisses every summoned ash.
 - **Solid ashes:** with `SolidAshes=true` summoned ashes look like normal characters instead of the blue ghost look (off by default).
-- **Free fighting:** `FreeFighting=Everywhere` (default) lets ashes fight in boss arenas until the boss is defeated and keep fighting in any fight on foot even if you walk away; `Bosses` only in boss arenas; `Off` keeps the game's own following. Ashes come through boss fog gates with you in every mode.
+- **Ashes come through boss fog gates** with you and appear in front of you.
+- **Free fighting** (off by default, `FreeFighting` in the INI): ashes fight where the enemy is instead of walking back to you.
+  - `Off` (default): they follow you as in the game.
+  - `Bosses`: in a boss fight they fight freely until the boss is defeated, with no warp pulling them back (field bosses and on Torrent too).
+  - `Everywhere`: as `Bosses`, and in any other fight on foot they keep fighting even if you walk away (up to 100 m). A new fight starts only near you, and about 2 s after the last blow they are warped back to your side. On Torrent outside boss fights they follow you as in the game.
 
 Everything is set in `MultipleSpiritAshes.ini` (comments explain each line). Changes apply when the game starts; the monument rules apply after the area reloads (rest at a grace).
 

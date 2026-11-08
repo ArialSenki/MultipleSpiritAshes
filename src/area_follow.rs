@@ -25,15 +25,21 @@
 //! BUDDY_NO_FOLLOW (297103), so the spirit AI fights where its target is
 //! instead of returning to the player at 23 m (common_logic_func.lua). A fog
 //! wall with no boss fight behind it changes nothing after the crossing.
-//! Elsewhere on foot, while any Ash fought in the last 10 s (combat animation
-//! 3000-9999) every Ash within 100 m carries BUDDY_NO_FOLLOW, and the game
+//! Elsewhere on foot, while any Ash fought in the last 2 s (combat animation
+//! 3000-9999; a new fight only from an Ash within 30 m of the player) every
+//! Ash within 100 m carries BUDDY_NO_FOLLOW, and the game
 //! warps an Ash only beyond 100 m, after 30 s out of sight or when stuck on
-//! its path; riding Torrent brings back the game's own warps and the usual
-//! following. Player event animations (60000-60999) are logged once each.
+//! its path. Once that fight is over the game's own warp triggers are back
+//! and every Ash farther than 25 m gets its native warp entry raised at once,
+//! so it comes back to the player with the game's fade (1.0.3 tests: Ashes
+//! 87 m away walked all the way back, and the game's own trigger alone left
+//! Ashes at 70-80 m long enough to start another fight there). Riding Torrent
+//! also keeps the game's own warps and the usual following. Player event animations (60000-60999) are logged once each.
 //! Switching the feature (or the mod) off puts the game's warp triggers back
 //! and takes BUDDY_NO_FOLLOW off every Ash (release_area_follow).
 //! Free fighting (nt_msa_set_free_fighting, INI FreeFighting) picks where
-//! the Ashes fight without the leash: everywhere (default), only in boss
+//! the Ashes fight without the leash: off (default, the game's own
+//! following), everywhere, or only in boss
 //! zones, or nowhere (the game's own following and warps; fog gates still
 //! bring the Ashes through).
 
@@ -90,6 +96,10 @@ pub(crate) struct AreaFollowState {
     /// Until when the Ashes count as fighting (last combat animation of any
     /// Ash + grace).
     fight_until: Option<Instant>,
+    /// A fight on foot was going on in the last pass (to see it end).
+    was_fighting: bool,
+    /// Until when no new fight starts (after the regroup warp).
+    regroup_until: Option<Instant>,
     /// Per Ash: last battle state logged.
     battle_logged: HashMap<usize, bool>,
     /// The player rides (Torrent): vanilla warps, no BUDDY_NO_FOLLOW.
@@ -125,11 +135,13 @@ struct BossZone {
 enum WarpProfile {
     /// Boss zone: out of reach.
     Boss,
-    /// On foot elsewhere: only far away (100 m) or long out of sight (30 s);
-    /// stuck on its path (the game's 3 s) still warps, as at small doors.
-    OnFoot,
-    /// Riding: the game's own values, so the Ashes keep up.
-    Riding,
+    /// A fight on foot elsewhere: only far away (100 m) or long out of sight
+    /// (30 s); stuck on its path (the game's 3 s) still warps, as at small
+    /// doors.
+    Fight,
+    /// The game's own values: no fight, riding, or free fighting off. After
+    /// a fight they bring far Ashes back to the player.
+    Game,
 }
 
 struct StuckTrace {
@@ -143,6 +155,10 @@ struct StuckTrace {
 }
 
 const STUCK_DISTANCE: f32 = 25.0;
+/// When a fight on foot ends, Ashes farther than this are warped back.
+const REGROUP_DISTANCE: f32 = 25.0;
+/// A fight on foot starts only from an Ash this close to the player.
+const NEW_FIGHT_DISTANCE: f32 = 30.0;
 /// Beyond this many times the stuck distance an Ash is warped even if the
 /// player stood still.
 const STUCK_FAR_FACTOR: f32 = 3.0;
@@ -187,8 +203,18 @@ const OPEN_WORLD_TIME_RAY_BLOCK: f32 = 30.0;
 /// beyond OPEN_WORLD_DIST_TO_PLAYER (no on/off flicker at the edge).
 const NO_FOLLOW_HYSTERESIS: f32 = 5.0;
 /// The Ashes still count as fighting this long after the last combat
-/// animation (attack, dodge, guard, hit) of any of them.
-const BATTLE_GRACE: Duration = Duration::from_secs(10);
+/// animation (attack, dodge, guard, hit) of any of them. With
+/// BUDDY_NO_FOLLOW and no target an Ash stands still, so this is also how
+/// long they wait after the last enemy before the regroup warp (10 s felt
+/// like "they do not come back", 6 s plus the game's 2 s fade still "takes
+/// long"; 4 s was liked, "half of it or a bit more" asked, in the 1.0.3
+/// tests).
+const BATTLE_GRACE: Duration = Duration::from_secs(2);
+/// After the regroup warp no new fight starts for this long: an Ash coming
+/// out of the warp plays animations in the combat range (5001/5002 at
+/// 10.9 m right after the warp in the 1.0.3 test), which held the Ashes
+/// still for another fight.
+const REGROUP_SETTLE: Duration = Duration::from_secs(6);
 const WARP_MANAGER_TIME_RAY_BLOCK_OFFSET: usize = 0x18;
 const WARP_MANAGER_DIST_TO_PLAYER_OFFSET: usize = 0x1c;
 const WARP_MANAGER_TIME_PATH_STACKED_OFFSET: usize = 0x20;
@@ -240,17 +266,19 @@ fn fog_gate_step(
     (played >= FOG_GATE_MIN_PLAY).then_some(played)
 }
 
-/// Free fighting: nowhere (the game's leash and warps).
+/// Free fighting: nowhere (the game's leash and warps; the default, so
+/// nothing changes for players who do not ask for it).
 pub const FREE_FIGHTING_OFF: u8 = 0;
 /// Free fighting only in boss zones.
 pub const FREE_FIGHTING_BOSSES: u8 = 1;
-/// Free fighting in boss zones and in any fight on foot (default).
+/// Free fighting in boss zones and in any fight on foot.
 pub const FREE_FIGHTING_EVERYWHERE: u8 = 2;
 static FREE_FIGHTING: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(FREE_FIGHTING_EVERYWHERE);
+    std::sync::atomic::AtomicU8::new(FREE_FIGHTING_OFF);
 
 /// Where the Ashes fight without the leash: 0 nowhere, 1 boss zones only,
-/// 2 boss zones and any fight on foot (default; larger values count as 2).
+/// 2 boss zones and any fight on foot (larger values count as 2). Off until
+/// called.
 /// Takes effect on the next frame.
 #[unsafe(no_mangle)]
 pub extern "C" fn nt_msa_set_free_fighting(mode: u8) {
@@ -323,7 +351,7 @@ pub(crate) fn update_area_follow(
         detect_fog_gate(&mut state, animation, now);
     }
     update_boss_zone(&mut state, boss_fight, now);
-    update_warp_profile(manager, &mut state);
+    update_warp_profile(manager, &mut state, now);
     update_no_follow(
         manager,
         buddy_to_trigger,
@@ -332,6 +360,16 @@ pub(crate) fn update_area_follow(
         player_position,
         now,
     );
+    if let Some(player) = player_position {
+        regroup_after_fight(
+            manager,
+            buddy_to_trigger,
+            dismissed_effects,
+            &mut state,
+            player,
+            now,
+        );
+    }
     trace_fog_warp(
         manager,
         &mut state,
@@ -375,8 +413,10 @@ fn update_stuck_ashes(
     let mut present = HashSet::new();
     let mut warp = None;
     let player_here = [player.0, player.1, player.2];
-    // On foot the Ashes may fight far away: only a really lost one is pulled.
-    let stuck_distance = if state.riding || !free_fighting().1 {
+    // In a fight on foot the Ashes may be far away: only a really lost one
+    // is pulled.
+    let in_fight = state.fight_until.is_some_and(|until| now < until);
+    let stuck_distance = if state.riding || !free_fighting().1 || !in_fight {
         STUCK_DISTANCE
     } else {
         OPEN_WORLD_DIST_TO_PLAYER
@@ -469,6 +509,79 @@ fn update_stuck_ashes(
         if raised { "raised" } else { "skipped" },
         state.stuck_warps,
         stage_before.map_or("missing".to_string(), |stage| stage.to_string())
+    ));
+}
+
+/// The fight on foot just ended: Ashes left far away are warped back now
+/// (their native warp entry set to stage 1, as for a stuck Ash) instead of
+/// waiting for the game's own trigger. Not in a boss zone, not riding, and
+/// only with free fighting on outside boss zones.
+fn regroup_after_fight(
+    manager: &mut SummonBuddyManager,
+    buddy_to_trigger: &HashMap<i32, i32>,
+    dismissed_effects: &HashSet<i32>,
+    state: &mut AreaFollowState,
+    player: HavokPosition,
+    now: Instant,
+) {
+    let fighting = state.fight_until.is_some_and(|until| now < until);
+    let ended = std::mem::replace(&mut state.was_fighting, fighting) && !fighting;
+    if !ended || state.boss_zone.is_some() || state.riding || !free_fighting().1 {
+        return;
+    }
+    let mut far = Vec::new();
+    for entry in manager.groups.iter_mut() {
+        for group in entry.second.iter_mut() {
+            let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
+                continue;
+            };
+            if group.is_remote || group.disappear_requested || dismissed_effects.contains(&effect) {
+                continue;
+            }
+            let chr = unsafe { group.chr_ins.as_ref() };
+            if !chr_alive(chr) {
+                continue;
+            }
+            let position = chr.modules.as_ref().physics.as_ref().position;
+            let distance = distance_3d(
+                [position.0, position.1, position.2],
+                [player.0, player.1, player.2],
+            );
+            if distance > REGROUP_DISTANCE {
+                far.push((chr.field_ins_handle, distance));
+            }
+        }
+    }
+    if far.is_empty() {
+        return;
+    }
+    let mut raised = 0usize;
+    let mut farthest = 0.0f32;
+    for pair in manager.warp_manager.as_ref().entries.iter() {
+        let Some((_, distance)) = far.iter().find(|(handle, _)| *handle == pair.first) else {
+            continue;
+        };
+        let stage = std::ptr::from_ref(&pair.second).cast::<u8>().cast_mut();
+        if unsafe { stage.read_volatile() } == 0 {
+            unsafe { stage.write_volatile(1) };
+            raised += 1;
+            farthest = farthest.max(*distance);
+        }
+    }
+    if raised > 0 {
+        state.regroup_until = Some(now + REGROUP_SETTLE);
+        // Same trace as a fog-gate warp: stage changes in the log, and the
+        // Ashes land in a row in front of the player when the game's spot
+        // is on the same level.
+        state.fog_trace = Some(FogTrace {
+            start: now,
+            stages: native_warp_entry_stages(manager),
+            placed: HashSet::new(),
+        });
+    }
+    log_line(format_args!(
+        "fight over: regroup warp raised={raised} far_ashes={} farthest={farthest:.1}",
+        far.len()
     ));
 }
 
@@ -620,18 +733,19 @@ fn update_boss_zone(state: &mut AreaFollowState, boss_fight: Option<bool>, now: 
     }
 }
 
-/// Profile for the current zone, mount and free-fighting choice.
+/// Profile for the current zone, mount, fight and free-fighting choice.
 fn warp_profile_for(
     boss_zone: bool,
     riding: bool,
+    fighting: bool,
     (free_boss, free_open): (bool, bool),
 ) -> WarpProfile {
     if boss_zone && free_boss {
         WarpProfile::Boss
-    } else if riding || !free_open {
-        WarpProfile::Riding
+    } else if riding || !free_open || !fighting {
+        WarpProfile::Game
     } else {
-        WarpProfile::OnFoot
+        WarpProfile::Fight
     }
 }
 
@@ -643,12 +757,12 @@ fn warp_trigger_values(profile: WarpProfile, saved: [f32; 3]) -> [f32; 3] {
             BOSS_ZONE_DIST_TO_PLAYER,
             BOSS_ZONE_TIME_PATH_STACKED,
         ],
-        WarpProfile::OnFoot => [
+        WarpProfile::Fight => [
             saved[0].max(OPEN_WORLD_TIME_RAY_BLOCK),
             saved[1].max(OPEN_WORLD_DIST_TO_PLAYER),
             saved[2],
         ],
-        WarpProfile::Riding => saved,
+        WarpProfile::Game => saved,
     }
 }
 
@@ -684,6 +798,7 @@ fn track_warp_manager(manager: &SummonBuddyManager, state: &mut AreaFollowState)
     state.raised_first_check = None;
     state.stuck.clear();
     state.fight_until = None;
+    state.was_fighting = false;
 }
 
 /// Whether switching area follow off has anything to undo.
@@ -704,7 +819,7 @@ pub(crate) fn release_area_follow(
     };
     track_warp_manager(manager, &mut state);
     let restored = match (state.warp_profile, state.saved_triggers) {
-        (Some(profile), Some(saved)) if profile != WarpProfile::Riding => {
+        (Some(profile), Some(saved)) if profile != WarpProfile::Game => {
             for (offset, value) in WARP_TRIGGER_OFFSETS.into_iter().zip(saved) {
                 unsafe { warp_manager_f32(manager, offset).write_volatile(value) };
             }
@@ -754,7 +869,11 @@ pub(crate) fn release_area_follow(
 }
 
 /// Writes the native warp triggers of the current profile when it changes.
-fn update_warp_profile(manager: &mut SummonBuddyManager, state: &mut AreaFollowState) {
+fn update_warp_profile(
+    manager: &mut SummonBuddyManager,
+    state: &mut AreaFollowState,
+    now: Instant,
+) {
     let saved = match state.saved_triggers {
         Some(saved) => saved,
         None => {
@@ -768,7 +887,7 @@ fn update_warp_profile(manager: &mut SummonBuddyManager, state: &mut AreaFollowS
                         "warp triggers left alone: unexpected values ray_block={:.2} dist={:.2} path_stacked={:.2}",
                         read[0], read[1], read[2]
                     ));
-                    state.warp_profile = Some(WarpProfile::Riding);
+                    state.warp_profile = Some(WarpProfile::Game);
                 }
                 return;
             }
@@ -776,7 +895,13 @@ fn update_warp_profile(manager: &mut SummonBuddyManager, state: &mut AreaFollowS
             read
         }
     };
-    let profile = warp_profile_for(state.boss_zone.is_some(), state.riding, free_fighting());
+    let fighting = state.fight_until.is_some_and(|until| now < until);
+    let profile = warp_profile_for(
+        state.boss_zone.is_some(),
+        state.riding,
+        fighting,
+        free_fighting(),
+    );
     if state.warp_profile == Some(profile) {
         return;
     }
@@ -801,7 +926,7 @@ fn no_follow_distance_limit(has_marker: bool) -> f32 {
 }
 
 /// BUDDY_NO_FOLLOW: on every Ash in a boss zone; elsewhere, on foot, on an
-/// Ash within 100 m while any Ash fought in the last 10 s, so it
+/// Ash within 100 m while any Ash fought in the last 2 s, so it
 /// fights where its target is instead of walking back at 23 m. Off while
 /// riding and once the fight is over, so the Ashes follow again.
 fn update_no_follow(
@@ -851,12 +976,20 @@ fn update_no_follow(
                 // enemy, stays with the fight instead of walking back.
                 let animation = current_animation(chr).0 % 1_000_000;
                 if (3000..10000).contains(&animation) {
-                    if state.fight_until.is_none_or(|until| now >= until) {
-                        log_line(format_args!(
-                            "ash fight started: effect={effect} animation={animation} distance={distance:.1}"
-                        ));
+                    let ongoing = state.fight_until.is_some_and(|until| now < until);
+                    // A new fight starts only near the player: an Ash left
+                    // far away after a fight does not start one of its own
+                    // there (1.0.3 test: a new fight at 69 m kept the Ashes
+                    // away). An ongoing fight goes on wherever it is.
+                    let settling = state.regroup_until.is_some_and(|until| now < until);
+                    if ongoing || (distance <= NEW_FIGHT_DISTANCE && !settling) {
+                        if !ongoing {
+                            log_line(format_args!(
+                                "ash fight started: effect={effect} animation={animation} distance={distance:.1}"
+                            ));
+                        }
+                        state.fight_until = Some(now + BATTLE_GRACE);
                     }
-                    state.fight_until = Some(now + BATTLE_GRACE);
                 }
                 let fighting = state.fight_until.is_some_and(|until| now < until)
                     && distance <= no_follow_distance_limit(has);
@@ -1309,14 +1442,14 @@ mod tests {
         assert!(!sane_warp_triggers([0.0, 33.0, 3.0]));
         assert!(!sane_warp_triggers([5.0, 1e9, 3.0]));
         assert!(!sane_warp_triggers([5.0, f32::NAN, 3.0]));
-        assert_eq!(warp_trigger_values(WarpProfile::Riding, game), game);
+        assert_eq!(warp_trigger_values(WarpProfile::Game, game), game);
         assert_eq!(
-            warp_trigger_values(WarpProfile::OnFoot, game),
+            warp_trigger_values(WarpProfile::Fight, game),
             [OPEN_WORLD_TIME_RAY_BLOCK, OPEN_WORLD_DIST_TO_PLAYER, 3.0]
         );
         // A game value already above the on-foot floor is kept.
         assert_eq!(
-            warp_trigger_values(WarpProfile::OnFoot, [40.0, 150.0, 3.0]),
+            warp_trigger_values(WarpProfile::Fight, [40.0, 150.0, 3.0]),
             [40.0, 150.0, 3.0]
         );
         let boss = warp_trigger_values(WarpProfile::Boss, game);
@@ -1357,20 +1490,38 @@ mod tests {
         assert_eq!(everywhere, (true, true));
         assert_eq!(bosses, (true, false));
         assert_eq!(off, (false, false));
-        assert_eq!(warp_profile_for(true, false, everywhere), WarpProfile::Boss);
-        assert_eq!(warp_profile_for(true, true, everywhere), WarpProfile::Boss);
+        // (boss zone, riding, fighting, choice)
         assert_eq!(
-            warp_profile_for(false, false, everywhere),
-            WarpProfile::OnFoot
+            warp_profile_for(true, false, false, everywhere),
+            WarpProfile::Boss
         );
         assert_eq!(
-            warp_profile_for(false, true, everywhere),
-            WarpProfile::Riding
+            warp_profile_for(true, true, true, everywhere),
+            WarpProfile::Boss
         );
-        assert_eq!(warp_profile_for(true, false, bosses), WarpProfile::Boss);
-        assert_eq!(warp_profile_for(false, false, bosses), WarpProfile::Riding);
-        assert_eq!(warp_profile_for(true, false, off), WarpProfile::Riding);
-        assert_eq!(warp_profile_for(false, false, off), WarpProfile::Riding);
+        assert_eq!(
+            warp_profile_for(false, false, true, everywhere),
+            WarpProfile::Fight
+        );
+        // The fight is over: the game's warps bring far Ashes back.
+        assert_eq!(
+            warp_profile_for(false, false, false, everywhere),
+            WarpProfile::Game
+        );
+        assert_eq!(
+            warp_profile_for(false, true, true, everywhere),
+            WarpProfile::Game
+        );
+        assert_eq!(
+            warp_profile_for(true, false, false, bosses),
+            WarpProfile::Boss
+        );
+        assert_eq!(
+            warp_profile_for(false, false, true, bosses),
+            WarpProfile::Game
+        );
+        assert_eq!(warp_profile_for(true, false, true, off), WarpProfile::Game);
+        assert_eq!(warp_profile_for(false, false, true, off), WarpProfile::Game);
     }
 
     #[test]

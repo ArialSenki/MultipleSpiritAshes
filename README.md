@@ -25,10 +25,11 @@ Offline only, with Easy Anti-Cheat disabled.
   the ones already out, and keeps track of each ash's FP cost.
 - `src/area_follow.rs` brings the ashes along through doors, fog walls, lifts
   and area changes using the game's own warp, and through boss fog gates. It
-  also handles free fighting: during a boss fight, and in other fights on
-  foot, the ashes fight where their target is instead of walking back to the
-  player (the game's warp distances are raised and a "no follow" marker is put
-  on each ash; both are put back afterwards).
+  also handles free fighting (off by default): during a boss fight, and in
+  other fights on foot, the ashes fight where their target is instead of
+  walking back to the player (the game's warp distances are raised and a "no
+  follow" marker is put on each ash; both are put back afterwards, and ashes
+  left far away are warped back when the fight ends).
 - `src/hud.rs` and `src/hud_movie.rs` replace the single spirit panel with one
   row per ash. The HUD movie is patched in memory, so no game files are shipped.
 - `src/native_prompt.rs` skips the summon/replace confirmation boxes.

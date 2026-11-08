@@ -71,7 +71,7 @@ impl Default for Config {
             resummon_without_rest: true,
             repeat_same_ash: false,
             solid_ashes: false,
-            free_fighting: FREE_FIGHTING_EVERYWHERE,
+            free_fighting: FREE_FIGHTING_OFF,
             dismiss_all_key: None,
             log_enabled: false,
         }
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn free_fighting_parses() {
-        assert_eq!(Config::default().free_fighting, FREE_FIGHTING_EVERYWHERE);
+        assert_eq!(Config::default().free_fighting, FREE_FIGHTING_OFF);
         assert_eq!(
             parse_free_fighting("Everywhere"),
             Some(FREE_FIGHTING_EVERYWHERE)
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(parse_free_fighting("1"), Some(FREE_FIGHTING_BOSSES));
         assert_eq!(parse_free_fighting("sometimes"), None);
         let kept = parse_config("FreeFighting=sometimes\n");
-        assert_eq!(kept.free_fighting, FREE_FIGHTING_EVERYWHERE);
+        assert_eq!(kept.free_fighting, FREE_FIGHTING_OFF);
     }
 
     #[test]

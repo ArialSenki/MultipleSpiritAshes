@@ -89,7 +89,7 @@ use windows::Win32::{
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "1.0.3-all-1.17";
+const BUILD_VERSION: &str = "1.0.4-all-1.17";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
 /// Named mutex the standalone copy holds for the life of the process, so the

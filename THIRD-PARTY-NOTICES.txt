@@ -1,6 +1,6 @@
 MULTIPLE SPIRIT ASHES
 THIRD-PARTY NOTICES
-Version 1.0.3 — Elden Ring 1.17.2 (2.7.2.0, JP 2.7.2.1), 1.17.1 (2.7.1.0, JP 2.7.1.1) and 1.17 (2.7.0.0)
+Version 1.0.4 — Elden Ring 1.17.2 (2.7.2.0, JP 2.7.2.1), 1.17.1 (2.7.1.0, JP 2.7.1.1) and 1.17 (2.7.0.0)
 Last updated: 2026-11-08
 
 SCOPE

@@ -2,6 +2,12 @@
 
 Same entries as the [Nexus page](https://www.nexusmods.com/eldenring/mods/11158). Newest first.
 
+## 1.0.4
+
+- Changed: free fighting is now off by default (FreeFighting=Off), so nothing changes unless you turn it on in the INI: Bosses or Everywhere.
+- Changed: with FreeFighting=Everywhere, when a fight on foot ends the ashes are warped back to your side about 2 s after the last blow, instead of standing far away; a new fight starts only near you.
+- Update: replace the DLL. If you took the 1.0.3 INI and want free fighting, keep FreeFighting=Everywhere or Bosses; an INI without the line now means Off.
+
 ## 1.0.3
 
 Includes 1.0.2, which was not released on its own.
