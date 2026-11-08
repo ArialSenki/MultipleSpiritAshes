@@ -12,8 +12,9 @@ use std::{
 };
 
 use multiple_spirit_ashes::{
-    NtMsaSettings, nt_msa_dismiss_all, nt_msa_engine_patches, nt_msa_set_ash_cost_percent,
-    nt_msa_set_buddy_stone_rules, nt_msa_set_solid_ashes, nt_msa_start,
+    FREE_FIGHTING_BOSSES, FREE_FIGHTING_EVERYWHERE, FREE_FIGHTING_OFF, NtMsaSettings,
+    mark_standalone, nt_msa_dismiss_all, nt_msa_engine_patches, nt_msa_set_ash_cost_percent,
+    nt_msa_set_buddy_stone_rules, nt_msa_set_free_fighting, nt_msa_set_solid_ashes, nt_msa_start,
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, HMODULE},
@@ -51,6 +52,7 @@ struct Config {
     resummon_without_rest: bool,
     repeat_same_ash: bool,
     solid_ashes: bool,
+    free_fighting: u8,
     dismiss_all_key: Option<i32>,
     log_enabled: bool,
 }
@@ -69,6 +71,7 @@ impl Default for Config {
             resummon_without_rest: true,
             repeat_same_ash: false,
             solid_ashes: false,
+            free_fighting: FREE_FIGHTING_EVERYWHERE,
             dismiss_all_key: None,
             log_enabled: false,
         }
@@ -95,7 +98,9 @@ fn run(module: isize) {
         damage_reduction_percent: config.damage_reduction_percent,
         repeat_same_ash: u8::from(config.repeat_same_ash),
     };
+    mark_standalone();
     nt_msa_set_ash_cost_percent(config.ash_cost_percent);
+    nt_msa_set_free_fighting(config.free_fighting);
     nt_msa_set_buddy_stone_rules(
         u8::from(config.summon_anywhere),
         u8::from(config.keep_ashes_after_boss),
@@ -191,6 +196,9 @@ fn parse_config(text: &str) -> Config {
                 config.repeat_same_ash = parse_bool(value).unwrap_or(config.repeat_same_ash)
             }
             "solidashes" => config.solid_ashes = parse_bool(value).unwrap_or(config.solid_ashes),
+            "freefighting" => {
+                config.free_fighting = parse_free_fighting(value).unwrap_or(config.free_fighting)
+            }
             "dismissallkey" => config.dismiss_all_key = parse_key(value),
             "logenabled" => config.log_enabled = parse_bool(value).unwrap_or(config.log_enabled),
             _ => {}
@@ -207,6 +215,16 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// FreeFighting: everywhere (2), bosses (1) or off (0).
+fn parse_free_fighting(value: &str) -> Option<u8> {
+    match value.to_ascii_lowercase().as_str() {
+        "everywhere" | "2" | "true" | "on" => Some(FREE_FIGHTING_EVERYWHERE),
+        "bosses" | "boss" | "1" => Some(FREE_FIGHTING_BOSSES),
+        "off" | "0" | "false" | "no" => Some(FREE_FIGHTING_OFF),
+        _ => None,
+    }
+}
+
 /// F1-F24, a letter or digit, or a virtual-key code (0x74). Empty = no key.
 fn parse_key(value: &str) -> Option<i32> {
     let value = value.trim().to_ascii_uppercase();
@@ -217,7 +235,9 @@ fn parse_key(value: &str) -> Option<i32> {
         return (1..=24).contains(&number).then_some(0x70 + number - 1);
     }
     if let Some(hex) = value.strip_prefix("0X") {
-        return i32::from_str_radix(hex, 16).ok().filter(|code| (1..=0xFE).contains(code));
+        return i32::from_str_radix(hex, 16)
+            .ok()
+            .filter(|code| (1..=0xFE).contains(code));
     }
     let mut chars = value.chars();
     match (chars.next(), chars.next()) {
@@ -235,7 +255,8 @@ mod tests {
         let config = parse_config(
             "[MultipleSpiritAshes]\nEnabled=true\nMaxActiveAshes=50\nAshCostPercent=400\nExtraAshCostPercent=50\n\
              DamageLossPerExtraAshPercent=99\nHudRows=false\nSummonAnywhere=no\n\
-             KeepAshesAfterBoss=yes\nResummonWithoutRest=on\nSolidAshes=true\nDismissAllKey=F5\nLogEnabled=1\n",
+             KeepAshesAfterBoss=yes\nResummonWithoutRest=on\nSolidAshes=true\nFreeFighting=Bosses\n\
+             DismissAllKey=F5\nLogEnabled=1\n",
         );
         assert!(config.enabled);
         assert_eq!(config.max_active_ashes, 50);
@@ -247,8 +268,23 @@ mod tests {
         assert!(config.keep_ashes_after_boss);
         assert!(config.resummon_without_rest);
         assert!(config.solid_ashes);
+        assert_eq!(config.free_fighting, FREE_FIGHTING_BOSSES);
         assert_eq!(config.dismiss_all_key, Some(0x74));
         assert!(config.log_enabled);
+    }
+
+    #[test]
+    fn free_fighting_parses() {
+        assert_eq!(Config::default().free_fighting, FREE_FIGHTING_EVERYWHERE);
+        assert_eq!(
+            parse_free_fighting("Everywhere"),
+            Some(FREE_FIGHTING_EVERYWHERE)
+        );
+        assert_eq!(parse_free_fighting("off"), Some(FREE_FIGHTING_OFF));
+        assert_eq!(parse_free_fighting("1"), Some(FREE_FIGHTING_BOSSES));
+        assert_eq!(parse_free_fighting("sometimes"), None);
+        let kept = parse_config("FreeFighting=sometimes\n");
+        assert_eq!(kept.free_fighting, FREE_FIGHTING_EVERYWHERE);
     }
 
     #[test]

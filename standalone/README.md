@@ -1,6 +1,6 @@
 # Multiple Spirit Ashes
 
-For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1) and **1.17.1** (2.7.1.0). One DLL for all of them. Play offline with Easy Anti-Cheat disabled.
+For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.7.2.1), **1.17.1** (2.7.1.0, and the Japanese 2.7.1.1) and **1.17** (2.7.0.0). One DLL for all of them. 1.17 and the Japanese 1.17.1 were only checked without running the game, so they are less tested. Play offline with Easy Anti-Cheat disabled.
 
 ## What it does
 
@@ -13,6 +13,7 @@ For Elden Ring (Windows): **1.17.2** (eldenring.exe 2.7.2.0, and the Japanese 2.
 - **HUD:** one compact row per ash with its name and HP (up to 7; "xN" for groups, "+N" when there are more), in place of the single spirit panel.
 - **Dismiss all:** an optional key dismisses every summoned ash.
 - **Solid ashes:** with `SolidAshes=true` summoned ashes look like normal characters instead of the blue ghost look (off by default).
+- **Free fighting:** `FreeFighting=Everywhere` (default) lets ashes fight in boss arenas until the boss is defeated and keep fighting in any fight on foot even if you walk away; `Bosses` only in boss arenas; `Off` keeps the game's own following. Ashes come through boss fog gates with you in every mode.
 
 Everything is set in `MultipleSpiritAshes.ini` (comments explain each line). Changes apply when the game starts; the monument rules apply after the area reloads (rest at a grace).
 
@@ -60,7 +61,7 @@ With Elden Mod Loader in `ELDEN RING\Game` (`dinput8.dll` and `mod_loader_config
 ## Notes
 
 - Seamless Co-op: the game starts with this mod, but several ashes at once has not been tested in co-op. Use the Compatibility file there, and please report how it goes.
-- The DLL checks the game version and the code it changes before touching anything; on other versions it does nothing.
+- The DLL checks the game version and the code it changes before touching anything; on versions it does not know it does nothing.
 - No game files are shipped: the HUD changes are applied in memory, on top of whichever HUD file is loaded.
 - Updating: replace the DLL; your INI can stay. From a much older version, replace the INI too.
 

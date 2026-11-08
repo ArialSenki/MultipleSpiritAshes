@@ -998,6 +998,10 @@ unsafe fn write_field<T: Copy>(object: *mut c_void, offset: usize, value: T) {
 /// MemoryFile accessors, i.e. the same field layout). Any other file type is
 /// left alone.
 unsafe fn patch_open_movie(file: *mut c_void) {
+    // The built-in copy that stood down for the standalone one changes nothing.
+    if super::stood_down() {
+        return;
+    }
     let memory_vtable = MEMORY_FILE_VTABLE.load(Ordering::Acquire) as *const usize;
     let vtable = unsafe { read_field::<*const usize>(file, 0) };
     let same_layout = vtable == memory_vtable
@@ -1297,7 +1301,7 @@ pub(crate) mod tests {
 
     /// (label, folder under MSA_TEST_EXE_DIR or test-gfx\exe holding that eldenring.exe,
     /// expected OpenFile RVA, expected MemoryFile vtable RVA)
-    const EXES: [(&str, &str, u32, u32); 5] = [
+    const EXES: [(&str, &str, u32, u32); 6] = [
         (
             "1.17 WW 2.7.0.0",
             "2.7.0.0",
@@ -1321,6 +1325,12 @@ pub(crate) mod tests {
             "2.7.1.1-jp",
             0xd6d280,
             0x2ba7d70,
+        ),
+        (
+            "JP 2.7.2.1",
+            "2.7.2.1-jp",
+            0xd6e970,
+            0x2baa020,
         ),
         (
             "Steam (current)",

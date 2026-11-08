@@ -1,6 +1,6 @@
 [package]
 name = "multiple-spirit-ashes"
-version = "1.0.0"
+version = "1.0.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -24,6 +24,10 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
 ]
+
+[features]
+# Melina as a companion (src/melina.rs): unfinished, off in every release.
+melina = []
 
 [lib]
 name = "multiple_spirit_ashes"

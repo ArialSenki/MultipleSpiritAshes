@@ -83,11 +83,14 @@ pub(crate) fn refresh_pending_summon_gate_latch(should_arm: bool, force_clear: b
 /// except while another Ash is selected, when status 2 would open the vanilla
 /// replace-summon confirmation. A live Ash selection keeps its dismissal UI.
 pub(crate) fn install_native_summon_prompt_hooks() -> bool {
+    let Some(rvas) = native_rvas() else {
+        return false;
+    };
     let mut installed = 0usize;
-    for (index, call_site_rva) in native_rvas().prompt_call_sites.into_iter().enumerate() {
+    for (index, call_site_rva) in rvas.prompt_call_sites.into_iter().enumerate() {
         let success = install_relative_branch_stub(
             call_site_rva,
-            native_rvas().buddy_state_function,
+            rvas.buddy_state_function,
             0xe8,
             build_selective_prompt_stub,
             match index {
@@ -100,9 +103,9 @@ pub(crate) fn install_native_summon_prompt_hooks() -> bool {
     }
     log_line(format_args!(
         "native summon-prompt hooks: installed={installed}/{}",
-        native_rvas().prompt_call_sites.len()
+        rvas.prompt_call_sites.len()
     ));
-    installed == native_rvas().prompt_call_sites.len()
+    installed == rvas.prompt_call_sites.len()
 }
 
 /// The final DoSummon gate can receive state -1 before the first summon has
@@ -111,23 +114,26 @@ pub(crate) fn install_native_summon_prompt_hooks() -> bool {
 /// game's allow state 0. Selecting a living Ash clears the latch and preserves
 /// the original dismissal flow.
 pub(crate) fn install_native_do_summon_gate_hook() -> bool {
+    let Some(rvas) = native_rvas() else {
+        return false;
+    };
     let program = Program::current();
     let Ok(site) = program
-        .rva_to_va(native_rvas().do_summon_gate)
+        .rva_to_va(rvas.do_summon_gate)
         .map(|address| address as usize)
     else {
         log_line("native DoSummon gate: site RVA is outside the executable");
         return false;
     };
     let Ok(allow_target) = program
-        .rva_to_va(native_rvas().do_summon_allow)
+        .rva_to_va(rvas.do_summon_allow)
         .map(|address| address as usize)
     else {
         log_line("native DoSummon gate: allow target is outside the executable");
         return false;
     };
     let Ok(continue_target) = program
-        .rva_to_va(native_rvas().do_summon_continue)
+        .rva_to_va(rvas.do_summon_continue)
         .map(|address| address as usize)
     else {
         log_line("native DoSummon gate: continuation target is outside the executable");
@@ -178,9 +184,9 @@ pub(crate) fn install_native_do_summon_gate_hook() -> bool {
 
     log_line(format_args!(
         "native DoSummon gate installed: site_rva={:#x} allow_rva={:#x} continue_rva={:#x} stub={:#x}",
-        native_rvas().do_summon_gate,
-        native_rvas().do_summon_allow,
-        native_rvas().do_summon_continue,
+        rvas.do_summon_gate,
+        rvas.do_summon_allow,
+        rvas.do_summon_continue,
         stub as usize
     ));
     true
@@ -452,6 +458,60 @@ pub(crate) fn build_selective_prompt_stub(original_target: usize) -> Vec<u8> {
     code
 }
 
+/// Writes `bytes` (all inside one aligned 8-byte block) with one 8-byte
+/// compare-and-swap, so no thread ever runs half of them; bytes of the block
+/// outside the patch keep whatever another writer put there meanwhile.
+unsafe fn store_within_qword(address: usize, bytes: &[u8]) -> bool {
+    let offset = address & 7;
+    if bytes.is_empty() || offset + bytes.len() > 8 {
+        return false;
+    }
+    let block = unsafe { &*((address - offset) as *const AtomicU64) };
+    let mut current = block.load(Ordering::Acquire);
+    loop {
+        let mut raw = current.to_le_bytes();
+        raw[offset..offset + bytes.len()].copy_from_slice(bytes);
+        match block.compare_exchange_weak(
+            current,
+            u64::from_le_bytes(raw),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Live code is changed so that a thread reaching it never decodes a mix of
+/// old and new bytes: a patch inside one aligned 8-byte block goes in with
+/// one atomic store; a longer one first gets a `jmp $` (EB FE) in its first
+/// two bytes, so a thread arriving meanwhile waits there, then the rest, then
+/// the first two bytes (Intel's cross-modifying code recipe). Only a patch
+/// whose first two bytes straddle an 8-byte boundary is copied plainly.
+unsafe fn write_code_bytes(address: usize, patch: &[u8]) {
+    let flush = |len: usize| unsafe {
+        let _ = FlushInstructionCache(GetCurrentProcess(), Some(address as *const c_void), len);
+    };
+    if unsafe { store_within_qword(address, patch) } {
+        return;
+    }
+    if patch.len() > 2 && unsafe { store_within_qword(address, &[0xeb, 0xfe]) } {
+        flush(2);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                patch[2..].as_ptr(),
+                (address + 2) as *mut u8,
+                patch.len() - 2,
+            );
+        }
+        flush(patch.len());
+        unsafe { store_within_qword(address, &patch[..2]) };
+        return;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(patch.as_ptr(), address as *mut u8, patch.len()) };
+}
+
 pub(crate) fn write_executable_patch(address: usize, patch: &[u8], label: &str) -> bool {
     let mut old_protection = PAGE_PROTECTION_FLAGS(0);
     if unsafe {
@@ -470,9 +530,7 @@ pub(crate) fn write_executable_patch(address: usize, patch: &[u8], label: &str) 
         return false;
     }
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(patch.as_ptr(), address as *mut u8, patch.len());
-    }
+    unsafe { write_code_bytes(address, patch) };
     let flushed = unsafe {
         FlushInstructionCache(
             GetCurrentProcess(),
@@ -545,9 +603,8 @@ pub(crate) fn selected_summon_goods_id(state: &RuntimeState) -> Option<i32> {
         .then_some(goods_id)
 }
 
-/// Per-frame policy for the native prompt and DoSummon hooks, the part of
-/// 0.1.165's `update_summon_dialog_policy` that drives them (without its
-/// SummonAnywhere and low-FP dismissal branches, which are not built in).
+/// Per-frame policy for the native prompt and DoSummon hooks (Summon
+/// anywhere lives in extras.rs, low-FP dismissal further down).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_native_prompt_flags(
     state: &RuntimeState,
@@ -713,11 +770,14 @@ pub(crate) static NATIVE_SUMMON_COST_RESTORED_CALLS: AtomicU64 = AtomicU64::new(
 /// the game charges the normal cost (and checks that the player has the FP).
 /// Dismissals keep the free state 2: the latch is never armed for a living Ash.
 pub(crate) fn install_native_summon_cost_hooks() -> bool {
+    let Some(rvas) = native_rvas() else {
+        return false;
+    };
     let mut installed = 0usize;
-    for (index, call_site_rva) in native_rvas().cost_call_sites.into_iter().enumerate() {
+    for (index, call_site_rva) in rvas.cost_call_sites.into_iter().enumerate() {
         let success = install_relative_branch_stub(
             call_site_rva,
-            native_rvas().buddy_state_function,
+            rvas.buddy_state_function,
             0xe8,
             build_summon_cost_stub,
             match index {
@@ -731,9 +791,9 @@ pub(crate) fn install_native_summon_cost_hooks() -> bool {
     }
     log_line(format_args!(
         "native summon-cost hooks: installed={installed}/{}",
-        native_rvas().cost_call_sites.len()
+        rvas.cost_call_sites.len()
     ));
-    installed == native_rvas().cost_call_sites.len()
+    installed == rvas.cost_call_sites.len()
 }
 
 pub(crate) fn build_summon_cost_stub(original_target: usize) -> Vec<u8> {
@@ -867,5 +927,36 @@ fn restore_living_ash_low_fp_costs() {
         {
             row.set_consume_mp(original);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(8))]
+    struct Code([u8; 32]);
+
+    #[test]
+    fn code_patches_land_whole() {
+        // Inside one aligned 8-byte block: one store; the rest is kept.
+        let mut code = Code([0x90; 32]);
+        let base = code.0.as_mut_ptr() as usize;
+        unsafe { write_code_bytes(base + 2, &[0xe8, 1, 2, 3, 4]) };
+        assert_eq!(&code.0[..8], &[0x90, 0x90, 0xe8, 1, 2, 3, 4, 0x90]);
+        // Longer than a block (the 57-byte style jump): every byte lands.
+        let mut code = Code([0xcc; 32]);
+        let base = code.0.as_mut_ptr() as usize;
+        let mut patch = [0x90u8; 20];
+        patch[..5].copy_from_slice(&[0xe9, 0x10, 0x20, 0x30, 0x40]);
+        unsafe { write_code_bytes(base + 3, &patch) };
+        assert_eq!(&code.0[3..23], &patch);
+        assert_eq!(code.0[2], 0xcc);
+        assert_eq!(code.0[23], 0xcc);
+        // First two bytes across a block boundary: plain copy, still whole.
+        let mut code = Code([0xcc; 32]);
+        let base = code.0.as_mut_ptr() as usize;
+        unsafe { write_code_bytes(base + 7, &patch) };
+        assert_eq!(&code.0[7..27], &patch);
     }
 }

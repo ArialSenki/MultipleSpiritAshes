@@ -5,6 +5,7 @@ use windows::core::PCSTR;
 
 mod bundle;
 mod rva_jp;
+mod rva_jp2711;
 mod rva_jp2721;
 mod rva_ww;
 mod rva_ww2720;
@@ -19,6 +20,7 @@ enum ERGameVersion {
     Ww2710,
     Ww2720,
     Jp2701,
+    Jp2711,
     Jp2721,
 }
 
@@ -31,6 +33,7 @@ impl GameVersion for ERGameVersion {
             (LANG_ID_EN, "2.7.1.0") => Some(Self::Ww2710),
             (LANG_ID_EN, "2.7.2.0") => Some(Self::Ww2720),
             (LANG_ID_JP, "2.7.0.1") => Some(Self::Jp2701),
+            (LANG_ID_JP, "2.7.1.1") => Some(Self::Jp2711),
             (LANG_ID_JP, "2.7.2.1") => Some(Self::Jp2721),
             _ => None,
         }
@@ -51,6 +54,7 @@ impl ERGameVersion {
             },
             Self::Ww2720 => rva_ww2720::RVAS,
             Self::Jp2701 => rva_jp::RVAS,
+            Self::Jp2711 => rva_jp2711::RVAS,
             Self::Jp2721 => rva_jp2721::RVAS,
         }
     }
@@ -98,8 +102,15 @@ mod tests {
             current.chr_ins_remove_speffect,
             previous.chr_ins_remove_speffect
         );
+        let jp2711 = ERGameVersion::from_lang_version(LANG_ID_JP, "2.7.1.1")
+            .unwrap()
+            .rvas();
+        // Same code as WW 2.7.1.0; only some vtables moved.
+        assert_eq!(jp2711.register_task, current.register_task);
+        assert_eq!(jp2711.chr_ins_apply_speffect, current.chr_ins_apply_speffect);
+        assert_ne!(jp2711.csez_task_vmt, current.csez_task_vmt);
         assert_eq!(
-            ERGameVersion::from_lang_version(LANG_ID_JP, "2.7.1.1"),
+            ERGameVersion::from_lang_version(LANG_ID_JP, "2.7.1.0"),
             None
         );
         assert_eq!(

@@ -28,7 +28,7 @@ static DIAGNOSTICS: AtomicU32 = AtomicU32::new(0);
 static HARDTEAR_LOGGED: AtomicBool = AtomicBool::new(false);
 /// When we last put the window back on, for telling our own expiry apart.
 static REAPPLIED_AT: Mutex<Option<Instant>> = Mutex::new(None);
-static INSTALL: Once = Once::new();
+static INSTALL: Mutex<()> = Mutex::new(());
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Sets the extra perfect-guard time. Returns 1 when the frame task runs, 0
@@ -36,14 +36,13 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 #[unsafe(no_mangle)]
 pub extern "C" fn nt_set_deflect_window(extra_ms: u32) -> u8 {
     EXTRA_MS.store(extra_ms, Ordering::Release);
-    INSTALL.call_once(|| {
-        let Ok(task_imp) = (unsafe { CSTaskImp::instance() }) else {
-            return;
-        };
-        let task = task_imp.run_recurring(deflect_task as fn(&FD4TaskData), CSTaskGroupIndex::FrameBegin);
-        std::mem::forget(task);
-        INSTALLED.store(true, Ordering::Release);
-    });
+    // On an unknown game version the bindings panic when the task is
+    // registered, and that would abort the game inside this extern "C"
+    // function (audit 2026-11-08).
+    if supported_version(Program::current()).is_none() {
+        return u8::from(extra_ms == 0);
+    }
+    crate::game_menus::install_frame_task(&INSTALL, &INSTALLED, deflect_task);
     u8::from(INSTALLED.load(Ordering::Acquire) || extra_ms == 0)
 }
 

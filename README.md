@@ -15,15 +15,20 @@ The same code ships in two ways:
   menu.
 
 Supported game versions: Elden Ring 1.17.2 (eldenring.exe 2.7.2.0 and the
-Japanese 2.7.2.1) and 1.17.1 (2.7.1.0), PC. On any other version the DLL
-leaves the game untouched. Offline only, with Easy Anti-Cheat disabled.
+Japanese 2.7.2.1), 1.17.1 (2.7.1.0 and the Japanese 2.7.1.1) and 1.17
+(2.7.0.0), PC. On any other version the DLL leaves the game untouched.
+Offline only, with Easy Anti-Cheat disabled.
 
 ## How it works, briefly
 
 - `src/lib.rs` hooks the summon and dismiss paths so a new ash doesn't replace
   the ones already out, and keeps track of each ash's FP cost.
 - `src/area_follow.rs` brings the ashes along through doors, fog walls, lifts
-  and area changes using the game's own warp.
+  and area changes using the game's own warp, and through boss fog gates. It
+  also handles free fighting: during a boss fight, and in other fights on
+  foot, the ashes fight where their target is instead of walking back to the
+  player (the game's warp distances are raised and a "no follow" marker is put
+  on each ash; both are put back afterwards).
 - `src/hud.rs` and `src/hud_movie.rs` replace the single spirit panel with one
   row per ash. The HUD movie is patched in memory, so no game files are shipped.
 - `src/native_prompt.rs` skips the summon/replace confirmation boxes.
@@ -47,6 +52,9 @@ build.cmd                   rem static library used by NativeTweaks
 build.cmd test              rem unit tests
 ```
 
+`src/melina.rs` (Melina as a companion) is unfinished and only built with
+`cargo build --features melina`; release builds leave it out.
+
 The output goes to `%LOCALAPPDATA%\MultipleSpiritAshes-standalone-build` (and
 `NativeTweaks-msa-build` for the library). See the top of `build.cmd` for the
 environment variables it accepts.
@@ -59,7 +67,8 @@ those tests are skipped.
 
 `vendor/fromsoftware-rs` is a copy of
 [fromsoftware-rs](https://github.com/vswarte/fromsoftware-rs) by Vincent
-Swarte and contributors, with address tables added for 2.7.2.0 and 2.7.2.1.
+Swarte and contributors, with address tables added for 2.7.2.0, 2.7.2.1 and
+2.7.1.1.
 It keeps its own MIT / Apache-2.0 licenses. The rest of the dependencies come
 from crates.io; see [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
 

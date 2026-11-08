@@ -25,6 +25,7 @@ use std::{
         LazyLock, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use eldenring::{
@@ -67,6 +68,9 @@ struct HudState {
     /// Effects of the living Ashes, oldest first.
     order: Vec<i32>,
     names: HashMap<i32, String>,
+    /// Effects whose name was not found, and when to look again (the
+    /// message tables can load after the first rows).
+    name_misses: HashMap<i32, Instant>,
     /// What the next copies show (written by the task, read by the hook).
     ashes: Vec<AshSummary>,
     last_status: String,
@@ -104,7 +108,9 @@ struct AshHudMember {
 /// Both are checked against the expected code first; without the hook the
 /// rows stay hidden (the task keeps running and only logs).
 pub(crate) fn install_native_hooks() {
-    let rvas = super::native_rvas();
+    let Some(rvas) = super::native_rvas() else {
+        return;
+    };
     let program = Program::current();
 
     if let Ok(lookup) = program.rva_to_va(rvas.msg_lookup_function) {
@@ -162,7 +168,9 @@ unsafe fn insert_rows(fe_manager: *mut CSFeManImp) -> [bool; ROW_SLOTS] {
     if fe_manager.is_null() {
         return written;
     }
-    let Ok(state) = HUD_STATE.lock() else {
+    // Never wait inside the game's HUD call: if the task holds the state
+    // right now, this copy shows no rows (the next one does).
+    let Ok(state) = HUD_STATE.try_lock() else {
         return written;
     };
     if state.ashes.is_empty() {
@@ -322,7 +330,12 @@ pub(crate) fn independent_ash_hud_task(_: &FD4TaskData) {
         return;
     }
 
-    let HudState { order, names, .. } = &mut *state;
+    let HudState {
+        order,
+        names,
+        name_misses,
+        ..
+    } = &mut *state;
     order.retain(|effect| groups.contains_key(effect));
     let mut new_effects = groups
         .keys()
@@ -336,7 +349,7 @@ pub(crate) fn independent_ash_hud_task(_: &FD4TaskData) {
         .iter()
         .filter_map(|effect| {
             let members = groups.get(effect)?;
-            let name = ash_name(names, *effect, members);
+            let name = ash_name(names, name_misses, *effect, members);
             let sum = |value: fn(&AshHudMember) -> u32| {
                 members
                     .iter()
@@ -390,10 +403,20 @@ pub(crate) fn independent_ash_hud_task(_: &FD4TaskData) {
 }
 
 /// The Ash item's name (the summon effect ID is the goods ID of the Ash),
-/// else the spirit's NPC name, else a placeholder. Found names are cached.
-fn ash_name(names: &mut HashMap<i32, String>, effect: i32, members: &[AshHudMember]) -> String {
+/// else the spirit's NPC name, else a placeholder. Found names are cached;
+/// a name not found is looked up again only every NAME_RETRY.
+fn ash_name(
+    names: &mut HashMap<i32, String>,
+    misses: &mut HashMap<i32, Instant>,
+    effect: i32,
+    members: &[AshHudMember],
+) -> String {
     if let Some(name) = names.get(&effect) {
         return name.clone();
+    }
+    let now = Instant::now();
+    if misses.get(&effect).is_some_and(|retry| now < *retry) {
+        return FALLBACK_NAME.to_owned();
     }
     let found = lookup_message(&GOODS_NAME_CATEGORIES, effect).or_else(|| {
         members
@@ -406,11 +429,18 @@ fn ash_name(names: &mut HashMap<i32, String>, effect: i32, members: &[AshHudMemb
         Some(name) => {
             super::log_line(format_args!("spirit ash HUD name: effect={effect} name={name}"));
             names.insert(effect, name.clone());
+            misses.remove(&effect);
             name
         }
-        None => FALLBACK_NAME.to_owned(),
+        None => {
+            misses.insert(effect, now + NAME_RETRY);
+            FALLBACK_NAME.to_owned()
+        }
     }
 }
+
+/// How often a name that was not found is looked up again.
+const NAME_RETRY: Duration = Duration::from_secs(2);
 
 fn lookup_message(categories: &[u32], id: i32) -> Option<String> {
     let lookup = MSG_LOOKUP.load(Ordering::Acquire);
@@ -568,11 +598,21 @@ mod tests {
     }
 
     #[test]
-    fn native_rvas_match_both_executables() {
+    fn native_rvas_match_every_executable() {
         // Each eldenring.exe is read from <MSA_TEST_EXE_DIR or test-gfx\exe>\<folder>.
         let root = std::env::var("MSA_TEST_EXE_DIR")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), r"\test-gfx\exe").to_owned());
         for (label, folder, rvas) in [
+            (
+                "1.17 WW 2.7.0.0",
+                "2.7.0.0",
+                crate::NATIVE_RVAS_WW2700,
+            ),
+            (
+                "1.17.1 JP 2.7.1.1",
+                "2.7.1.1-jp",
+                crate::NATIVE_RVAS_WW2710,
+            ),
             (
                 "1.17.1 WW 2.7.1.0",
                 "2.7.1.0",
@@ -591,9 +631,43 @@ mod tests {
         ] {
             let path = format!(r"{root}\{folder}\eldenring.exe");
             let Ok(exe) = std::fs::read(&path) else {
-                eprintln!("skipped: {path} not found");
-                continue;
+                panic!("{label}: {path} not found");
             };
+            // The same checks the DLL makes before it changes each site.
+            let branch_target = |site: u32| {
+                let code = read_rva(&exe, site, 5);
+                assert_eq!(code[0], 0xe8, "{label}: {site:#x}");
+                (site as i64 + 5 + i64::from(i32::from_le_bytes(code[1..5].try_into().unwrap())))
+                    as u32
+            };
+            assert_eq!(rvas.clear_callsite & 7, 0, "{label}");
+            assert_eq!(
+                read_rva(&exe, rvas.clear_callsite, 8),
+                [0xe8, 0xeb, 0x2f, 0x00, 0x00, 0x41, 0x83, 0xbf],
+                "{label}"
+            );
+            assert_eq!(branch_target(rvas.clear_callsite), rvas.clear_function, "{label}");
+            assert_eq!(rvas.exit_function & 7, 0, "{label}");
+            assert_eq!(
+                read_rva(&exe, rvas.exit_function, 8),
+                crate::NATIVE_EXIT_FUNCTION_PROLOGUE,
+                "{label}"
+            );
+            assert_eq!(
+                read_rva(&exe, rvas.exit_group_filter, 10),
+                crate::NATIVE_EXIT_GROUP_FILTER_SIGNATURE,
+                "{label}"
+            );
+            for site in rvas.prompt_call_sites.into_iter().chain(rvas.cost_call_sites) {
+                assert_eq!(branch_target(site), rvas.buddy_state_function, "{label}: {site:#x}");
+            }
+            assert_eq!(
+                read_rva(&exe, rvas.do_summon_gate, 5),
+                [0x83, 0xf8, 0x01, 0x76, 0x1b],
+                "{label}"
+            );
+            assert_eq!(rvas.do_summon_continue, rvas.do_summon_gate + 5, "{label}");
+            assert_eq!(rvas.do_summon_allow, rvas.do_summon_gate + 0x20, "{label}");
             let call = read_rva(&exe, rvas.fe_friend_tag_copy_call_site, 5);
             assert_eq!(call[0], 0xe8, "{label}");
             let target = (rvas.fe_friend_tag_copy_call_site as i64

@@ -20,7 +20,7 @@ const INTERVAL: Duration = Duration::from_millis(250);
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static CARRIER_READY: AtomicBool = AtomicBool::new(false);
 static LAST_APPLIED: Mutex<Option<Instant>> = Mutex::new(None);
-static INSTALL: Once = Once::new();
+static INSTALL: Mutex<()> = Mutex::new(());
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Turns the cleaning on or off. Returns 1 when the frame task runs, 0 when
@@ -31,14 +31,13 @@ pub extern "C" fn nt_set_player_clean(enabled: u8) -> u8 {
     if enabled == 0 {
         return 1;
     }
-    INSTALL.call_once(|| {
-        let Ok(task_imp) = (unsafe { CSTaskImp::instance() }) else {
-            return;
-        };
-        let task = task_imp.run_recurring(clean_task as fn(&FD4TaskData), CSTaskGroupIndex::FrameBegin);
-        std::mem::forget(task);
-        INSTALLED.store(true, Ordering::Release);
-    });
+    // On an unknown game version the bindings panic when the task is
+    // registered, and that would abort the game inside this extern "C"
+    // function (audit 2026-11-08).
+    if supported_version(Program::current()).is_none() {
+        return 0;
+    }
+    crate::game_menus::install_frame_task(&INSTALL, &INSTALLED, clean_task);
     u8::from(INSTALLED.load(Ordering::Acquire))
 }
 

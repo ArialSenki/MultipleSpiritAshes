@@ -70,7 +70,7 @@ const SUMMON_INTERVAL: Duration = Duration::from_secs(5);
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 static COMPANION: AtomicBool = AtomicBool::new(false);
 static ROWS_READY: AtomicBool = AtomicBool::new(false);
-static INSTALL: Once = Once::new();
+static INSTALL: Mutex<()> = Mutex::new(());
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 struct CompanionState {
@@ -105,14 +105,13 @@ static STATE: Mutex<CompanionState> = Mutex::new(CompanionState {
 });
 
 fn install() -> bool {
-    INSTALL.call_once(|| {
-        let Ok(task_imp) = (unsafe { CSTaskImp::instance() }) else {
-            return;
-        };
-        let task = task_imp.run_recurring(melina_task as fn(&FD4TaskData), CSTaskGroupIndex::FrameBegin);
-        std::mem::forget(task);
-        INSTALLED.store(true, Ordering::Release);
-    });
+    // On an unknown game version the bindings panic when the task is
+    // registered, and that would abort the game inside this extern "C"
+    // function (audit 2026-11-08).
+    if supported_version(Program::current()).is_none() {
+        return false;
+    }
+    crate::game_menus::install_frame_task(&INSTALL, &INSTALLED, melina_task);
     INSTALLED.load(Ordering::Acquire)
 }
 

@@ -2,6 +2,24 @@
 
 Same entries as the [Nexus page](https://www.nexusmods.com/eldenring/mods/11158). Newest first.
 
+## 1.0.3
+
+Includes 1.0.2, which was not released on its own.
+
+- Added: at a boss fog gate your ashes come through with you and appear in front of you, instead of staying behind the wall.
+- Added: free fighting (FreeFighting in the INI). In a boss fight the ashes fight freely until the boss is defeated, with no warp pulling them back (field bosses and on Torrent too); in other fights on foot they keep fighting even if you walk away, up to 100 m. Bosses = boss fights only, Off = the game's own following.
+- Changed: on Torrent, outside boss fights, the ashes follow and warp to you as in the game.
+- Fixed: a new ash appears a little in front of you, as in the game, not at your side.
+- Fixed: safer changes to the game's code, and an error inside the mod no longer closes the game.
+- Update: replace the DLL; your INI can stay (without the new FreeFighting line it works as Everywhere).
+
+## 1.0.1
+
+- Added: the Japanese 1.17.1 (2.7.1.1), where the mod did nothing.
+- Added: the full mod on 1.17 (2.7.0.0): no confirmation boxes, dismissing one ash at a time and the HUD rows. Before, only part of it was active there.
+- 1.17 and the Japanese 1.17.1 were only checked without running the game, so they are less tested.
+- Update: replace the DLL; your INI can stay.
+
 ## 1.0.0
 
 - Leaves alpha: no more Alpha in the name, and the version is now 1.0.0.

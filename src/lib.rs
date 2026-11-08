@@ -6,6 +6,7 @@ mod extras;
 mod game_menus;
 mod hud;
 mod hud_movie;
+#[cfg(feature = "melina")]
 mod melina;
 mod native_prompt;
 mod perf;
@@ -19,7 +20,7 @@ use std::{
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     sync::{
-        LazyLock, Mutex, Once, OnceLock, RwLock,
+        Arc, LazyLock, Mutex, Once, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -46,8 +47,27 @@ pub use engine_patches::nt_msa_engine_patches;
 pub use game_menus::{nt_game_menu_last_result, nt_open_game_menu};
 pub use deflect::nt_set_deflect_window;
 pub use clean::nt_set_player_clean;
+pub use area_follow::{
+    FREE_FIGHTING_BOSSES, FREE_FIGHTING_EVERYWHERE, FREE_FIGHTING_OFF, nt_msa_set_free_fighting,
+};
 pub use solid::nt_msa_set_solid_ashes;
+#[cfg(feature = "melina")]
 pub use melina::{nt_set_melina_companion, nt_summon_melina};
+
+/// Melina as a companion is unfinished and not built by default (cargo
+/// feature "melina"); NativeTweaks still links these two, which then do
+/// nothing.
+#[cfg(not(feature = "melina"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn nt_summon_melina() -> u8 {
+    0
+}
+
+#[cfg(not(feature = "melina"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn nt_set_melina_companion(_enabled: u8) -> u8 {
+    0
+}
 use native_prompt::*;
 use pelite::pe64::Pe;
 use windows::core::PCWSTR;
@@ -60,15 +80,44 @@ use windows::Win32::{
             MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualAlloc,
             VirtualProtect,
         },
-        Threading::GetCurrentProcess,
+        Threading::{
+            CreateMutexW, GetCurrentProcess, GetCurrentProcessId, OpenMutexW,
+            SYNCHRONIZATION_SYNCHRONIZE,
+        },
     },
 };
 
 const LOG_FILE_NAME: &str = "NativeTweaks.SpiritAshes.log";
 const STANDALONE_LOG_FILE_NAME: &str = "MultipleSpiritAshes.log";
-const BUILD_VERSION: &str = "1.0.0-ww2710-ww2720";
+const BUILD_VERSION: &str = "1.0.3-all-1.17";
 /// The standalone mod; it must not run beside the built-in copy.
 const STANDALONE_DLL_NAME: &str = "MultipleSpiritAshes.dll";
+/// Named mutex the standalone copy holds for the life of the process, so the
+/// built-in copy stands down even if the DLL was renamed.
+const STANDALONE_MUTEX_PREFIX: &str = "Local\\MultipleSpiritAshes-standalone-";
+/// The standalone DLL calls mark_standalone before nt_msa_start.
+static STANDALONE_MARKED: AtomicBool = AtomicBool::new(false);
+/// The built-in copy found the standalone one after it had started: it
+/// installs nothing more and its HUD movie hook serves files unchanged.
+static STOOD_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Called by the standalone DLL (standalone/) before nt_msa_start: this copy
+/// is the standalone one, whatever the DLL file is called.
+pub fn mark_standalone() {
+    STANDALONE_MARKED.store(true, Ordering::Release);
+}
+
+/// The built-in copy stood down for the standalone one.
+pub(crate) fn stood_down() -> bool {
+    STOOD_DOWN.load(Ordering::Acquire)
+}
+
+fn standalone_mutex_name() -> Vec<u16> {
+    format!("{STANDALONE_MUTEX_PREFIX}{}", unsafe { GetCurrentProcessId() })
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
 const MIN_ITEM_ACTION_INTERVAL_SECONDS: f32 = 0.75;
 const DISMISS_FADE_SECONDS: f32 = 1.5;
 const DISMISS_VISUAL_SP_EFFECT_ID: i32 = 16316;
@@ -120,6 +169,13 @@ const NATIVE_RVAS_WW2710: NativeRvas = NativeRvas {
     msg_lookup_function: 0x266fc40,
 };
 
+/// WW 2.7.0.0 (Elden Ring 1.17): the 2.7.1.0 addresses, except the message
+/// lookup. Verified offline (hud.rs, native_rvas_match_every_executable).
+const NATIVE_RVAS_WW2700: NativeRvas = NativeRvas {
+    msg_lookup_function: 0x266fbd0,
+    ..NATIVE_RVAS_WW2710
+};
+
 /// WW 2.7.2.0 (Elden Ring 1.17.2): the same code moved by +0xe0. Verified
 /// offline against both executables (research/verify_native_rvas.py).
 const NATIVE_RVAS_WW2720: NativeRvas = NativeRvas {
@@ -140,9 +196,10 @@ const NATIVE_RVAS_WW2720: NativeRvas = NativeRvas {
 
 static NATIVE_RVAS: OnceLock<NativeRvas> = OnceLock::new();
 
-/// RVAs for the running executable; set before any hook is installed.
-fn native_rvas() -> &'static NativeRvas {
-    NATIVE_RVAS.get().unwrap_or(&NATIVE_RVAS_WW2710)
+/// RVAs for the running executable; set before any hook is installed. None
+/// before that: no hook is installed against a guessed table.
+fn native_rvas() -> Option<&'static NativeRvas> {
+    NATIVE_RVAS.get()
 }
 const NATIVE_EXIT_FUNCTION_PROLOGUE: [u8; 8] = [0x40, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x30];
 const NATIVE_EXIT_GROUP_FILTER_SIGNATURE: [u8; 10] =
@@ -156,15 +213,14 @@ static PARAM_REPOSITORY_WAIT_REPORTED: AtomicBool = AtomicBool::new(false);
 static PARAM_TARGETS_WAIT_REPORTED: AtomicBool = AtomicBool::new(false);
 static DISMISS_VFX_PARAM_REPORTED: AtomicBool = AtomicBool::new(false);
 static DISMISS_VFX_PARAM_MISSING_REPORTED: AtomicBool = AtomicBool::new(false);
-static LAST_CLEARED_BUDDY_STONE_EFFECT: AtomicIsize = AtomicIsize::new(0);
 static LAST_ELIGIBILITY_REQUEST_EFFECT: AtomicIsize = AtomicIsize::new(-1);
 /// Last logged combination of the game's summon gates (see "summon gates").
 static LAST_SUMMON_GATE: AtomicU64 = AtomicU64::new(u64::MAX);
 static NATIVE_CLEAR_GUARD_READY: AtomicBool = AtomicBool::new(false);
-static NATIVE_CLEAR_GUARD_STUB: AtomicIsize = AtomicIsize::new(0);
 static ORIGINAL_NATIVE_CLEAR_GROUPS: AtomicIsize = AtomicIsize::new(0);
+/// A native hook panicked once (logged once).
+static HOOK_PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
 static NATIVE_EXIT_FILTER_READY: AtomicBool = AtomicBool::new(false);
-static NATIVE_EXIT_FILTER_PAGE: AtomicIsize = AtomicIsize::new(0);
 static ORIGINAL_NATIVE_EXIT_ROUTINE: AtomicIsize = AtomicIsize::new(0);
 static NATIVE_EXIT_TARGET_STARTED: AtomicIsize = AtomicIsize::new(-1);
 static NATIVE_EXIT_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -180,6 +236,8 @@ static LAST_SPAWN_SYNC_EFFECT: AtomicIsize = AtomicIsize::new(-1);
 /// The upgrade level in use for each spirit ash: BuddyParam -> its trigger
 /// SpEffect as the game last reported it active or requested.
 static TRIGGER_IN_USE: LazyLock<Mutex<HashMap<i32, i32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The log file could not be opened: not retried on every line.
+static LOG_OPEN_FAILED: AtomicBool = AtomicBool::new(false);
 
 static REPORTED_PRESERVED_EFFECTS: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -193,8 +251,9 @@ static STANDALONE_BUILD: AtomicBool = AtomicBool::new(false);
 /// the compact rows keep running even after the feature is switched off.
 static HUD_ROWS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// What NativeTweaks controls (layout shared with src/spirit_ashes.cpp).
-/// Everything else keeps the defaults of the standalone mod's shipped INI.
+/// What NativeTweaks controls (layout shared with src/spirit_ashes.cpp); the
+/// standalone DLL fills it from its INI. Other options have their own
+/// nt_msa_set_* exports.
 #[repr(C)]
 pub struct NtMsaSettings {
     pub enabled: u8,
@@ -205,8 +264,9 @@ pub struct NtMsaSettings {
     /// Hides every Spirit Ash confirmation: the item rows' prompts are cleared
     /// up front, so none can open before the policy sees the new selection.
     pub suppress_prompts: u8,
-    /// After a block change or other player jump, raise the native "warp
-    /// all" flag so the Ashes follow (area_follow.rs).
+    /// Area follow (area_follow.rs): warps after block changes and stuck
+    /// Ashes, fog-gate crossing, boss zone and free fighting (warp trigger
+    /// profiles, BUDDY_NO_FOLLOW).
     pub follow_areas: u8,
     /// Remove a dismissed Ash after a 1.5 s fade instead of the full native
     /// exit animation (~6.7 s).
@@ -239,7 +299,13 @@ pub unsafe extern "C" fn nt_msa_start(module: *mut c_void, hub: *const NtMsaSett
         return 0;
     }
     DLL_MODULE.store(module as isize, Ordering::Relaxed);
-    STANDALONE_BUILD.store(module_is_standalone_dll(), Ordering::Release);
+    let standalone = STANDALONE_MARKED.load(Ordering::Acquire) || module_is_standalone_dll();
+    STANDALONE_BUILD.store(standalone, Ordering::Release);
+    if standalone {
+        // Held (never closed) for the life of the process.
+        let name = standalone_mutex_name();
+        let _ = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
+    }
     apply_hub_settings(initial);
     let Some(version) = supported_version(Program::current()) else {
         log_line("unsupported executable version; no game memory was changed");
@@ -255,9 +321,8 @@ pub unsafe extern "C" fn nt_msa_start(module: *mut c_void, hub: *const NtMsaSett
         // The HUD movie is opened early, so this hook goes in before the
         // start delay; it patches 01_000_fe.gfx in memory when it loads.
         // Only when the feature is on at startup: off, the vanilla panel stays.
-        // Only where the HUD row hooks exist (WW 2.7.1.0 / 2.7.2.0): elsewhere
-        // the patch would hide the vanilla panel with no rows to replace it.
-        if settings().enabled && settings().patch_hud_movie && version.native_rvas().is_some() {
+        // Every supported executable has the HUD row hooks that replace it.
+        if settings().enabled && settings().patch_hud_movie {
             HUD_ROWS_INSTALLED.store(hud_movie::install(), Ordering::Release);
         } else {
             log_line("HUD movie patch skipped (feature off at startup); menu/01_000_fe.gfx served unchanged");
@@ -268,6 +333,7 @@ pub unsafe extern "C" fn nt_msa_start(module: *mut c_void, hub: *const NtMsaSett
             return;
         }
         if standalone_loaded() {
+            STOOD_DOWN.store(true, Ordering::Release);
             log_line("MultipleSpiritAshes.dll was loaded later: the built-in copy stays off");
             return;
         }
@@ -336,7 +402,17 @@ fn standalone_dll_present() -> bool {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    unsafe { GetModuleHandleW(PCWSTR(name.as_ptr())) }.is_ok()
+    if unsafe { GetModuleHandleW(PCWSTR(name.as_ptr())) }.is_ok() {
+        return true;
+    }
+    let mutex = standalone_mutex_name();
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(mutex.as_ptr())) } {
+        Ok(handle) => {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -344,7 +420,7 @@ enum SupportedErVersion {
     Ww2700,
     Ww2710,
     Ww2720,
-    Jp2701,
+    Jp2711,
     Jp2721,
 }
 
@@ -356,7 +432,7 @@ impl GameVersion for SupportedErVersion {
             (LANG_ID_EN, "2.7.0.0") => Some(Self::Ww2700),
             (LANG_ID_EN, "2.7.1.0") => Some(Self::Ww2710),
             (LANG_ID_EN, "2.7.2.0") => Some(Self::Ww2720),
-            (LANG_ID_JP, "2.7.0.1") => Some(Self::Jp2701),
+            (LANG_ID_JP, "2.7.1.1") => Some(Self::Jp2711),
             (LANG_ID_JP, "2.7.2.1") => Some(Self::Jp2721),
             _ => None,
         }
@@ -364,14 +440,15 @@ impl GameVersion for SupportedErVersion {
 }
 
 impl SupportedErVersion {
-    /// Executables whose native hook sites were verified.
-    fn native_rvas(self) -> Option<NativeRvas> {
+    /// Native hook sites, verified for every supported executable.
+    fn native_rvas(self) -> NativeRvas {
         match self {
-            Self::Ww2710 => Some(NATIVE_RVAS_WW2710),
+            Self::Ww2700 => NATIVE_RVAS_WW2700,
+            // JP 2.7.1.1 has the code of WW 2.7.1.0 at every address in this table.
+            Self::Ww2710 | Self::Jp2711 => NATIVE_RVAS_WW2710,
             // JP 2.7.2.1 has the code of WW 2.7.2.0 at every address in this
             // table (compared byte for byte, 24-10).
-            Self::Ww2720 | Self::Jp2721 => Some(NATIVE_RVAS_WW2720),
-            Self::Ww2700 | Self::Jp2701 => None,
+            Self::Ww2720 | Self::Jp2721 => NATIVE_RVAS_WW2720,
         }
     }
 
@@ -380,7 +457,7 @@ impl SupportedErVersion {
             Self::Ww2700 => "WW 2.7.0.0",
             Self::Ww2710 => "WW 2.7.1.0",
             Self::Ww2720 => "WW 2.7.2.0",
-            Self::Jp2701 => "JP 2.7.0.1",
+            Self::Jp2711 => "JP 2.7.1.1",
             Self::Jp2721 => "JP 2.7.2.1",
         }
     }
@@ -401,40 +478,36 @@ fn install_tasks_once(version: SupportedErVersion) {
         };
 
         log_line(format_args!("game executable: {}", version.label()));
-        if let Some(rvas) = version.native_rvas() {
-            let _ = NATIVE_RVAS.set(rvas);
-            // Installed always (each stub follows its flag), so the Hub's
-            // No summoning prompts option can change at any time.
-            let prompt_hooks = install_native_summon_prompt_hooks();
-            NATIVE_SUMMON_PROMPT_HOOKS_READY.store(prompt_hooks, Ordering::Release);
-            let do_summon_gate = prompt_hooks && install_native_do_summon_gate_hook();
-            NATIVE_DO_SUMMON_GATE_READY.store(do_summon_gate, Ordering::Release);
-            let cost_hooks = do_summon_gate && install_native_summon_cost_hooks();
-            if do_summon_gate && !cost_hooks {
-                log_line("native summon-cost hooks incomplete; additional Ashes may be summoned without their FP cost");
-            }
-            if !prompt_hooks || !do_summon_gate {
-                log_line(format_args!(
-                    "native summon-prompt hooks unavailable (prompt_hooks={prompt_hooks} do_summon_gate={do_summon_gate}); the replace prompt can still appear"
-                ));
-            }
-            let exit_filter_installed = install_native_exit_filter();
-            NATIVE_EXIT_FILTER_READY.store(exit_filter_installed, Ordering::Release);
-            if !exit_filter_installed {
-                log_line("native scoped-dismissal hook unavailable; selected dismissal will use the manual fade path");
-            }
+        let _ = NATIVE_RVAS.set(version.native_rvas());
+        // Installed always (each stub follows its flag), so the Hub's
+        // No summoning prompts option can change at any time.
+        let prompt_hooks = install_native_summon_prompt_hooks();
+        NATIVE_SUMMON_PROMPT_HOOKS_READY.store(prompt_hooks, Ordering::Release);
+        let do_summon_gate = prompt_hooks && install_native_do_summon_gate_hook();
+        NATIVE_DO_SUMMON_GATE_READY.store(do_summon_gate, Ordering::Release);
+        let cost_hooks = do_summon_gate && install_native_summon_cost_hooks();
+        if do_summon_gate && !cost_hooks {
+            log_line("native summon-cost hooks incomplete; additional Ashes may be summoned without their FP cost");
+        }
+        if !prompt_hooks || !do_summon_gate {
+            log_line(format_args!(
+                "native summon-prompt hooks unavailable (prompt_hooks={prompt_hooks} do_summon_gate={do_summon_gate}); the replace prompt can still appear"
+            ));
+        }
+        let exit_filter_installed = install_native_exit_filter();
+        NATIVE_EXIT_FILTER_READY.store(exit_filter_installed, Ordering::Release);
+        if !exit_filter_installed {
+            log_line("native scoped-dismissal hook unavailable; selected dismissal will use the manual fade path");
+        }
 
-            let installed = install_native_clear_guard();
-            NATIVE_CLEAR_GUARD_READY.store(installed, Ordering::Release);
-            if !installed {
-                log_line("native owner-group guard unavailable; pending switch forwarding disabled");
-            }
+        let installed = install_native_clear_guard();
+        NATIVE_CLEAR_GUARD_READY.store(installed, Ordering::Release);
+        if !installed {
+            log_line("native owner-group guard unavailable; pending switch forwarding disabled");
+        }
 
-            if hud_rows_active() {
-                hud::install_native_hooks();
-            }
-        } else {
-            log_line("native owner-group guard is only verified for WW 2.7.1.0 and 2.7.2.0; pending switch forwarding disabled");
+        if hud_rows_active() {
+            hud::install_native_hooks();
         }
 
         let policy_task = task_imp.run_recurring(
@@ -459,26 +532,16 @@ fn install_tasks_once(version: SupportedErVersion) {
             std::mem::forget(eligibility_task);
         }
 
-        if matches!(
-            version,
-            SupportedErVersion::Ww2700
-                | SupportedErVersion::Ww2710
-                | SupportedErVersion::Ww2720
-                | SupportedErVersion::Jp2721
-        ) {
-            let hud_task = task_imp.run_recurring(
-                timed_hud_task as fn(&FD4TaskData),
-                CSTaskGroupIndex::ScaleformStep,
-            );
-            std::mem::forget(hud_task);
-            log_line("compact independent spirit ash HUD task registered at ScaleformStep (WW 2.7.0.0/2.7.1.0/2.7.2.0; 2.7.1.0 and 2.7.2.0 remain experimental)");
-        } else {
-            log_line("compact independent spirit ash HUD unavailable: FE layout is not enabled for this game version");
-        }
+        let hud_task = task_imp.run_recurring(
+            timed_hud_task as fn(&FD4TaskData),
+            CSTaskGroupIndex::ScaleformStep,
+        );
+        std::mem::forget(hud_task);
+        log_line("compact independent spirit ash HUD task registered at ScaleformStep");
 
         let settings = settings();
         log_line(format_args!(
-            "initialised: build={}, native_exit_filter={}, native_clear_guard={}, native_prompt_hooks={}, native_do_summon_gate={}, max_active_ashes={} (0=unlimited), toggle_dismiss={}, patch_buddy_item_limits={}, suppress_spirit_ash_confirmation={}, suppress_additional_summon_prompt={}, clear_active_buddy_stone_link={}, temporary_pending_item_unlink={}, log_enabled={}",
+            "initialised: build={}, native_exit_filter={}, native_clear_guard={}, native_prompt_hooks={}, native_do_summon_gate={}, max_active_ashes={} (0=unlimited), toggle_dismiss={}, suppress_spirit_ash_confirmation={}, suppress_additional_summon_prompt={}, log_enabled={}",
             BUILD_VERSION,
             NATIVE_EXIT_FILTER_READY.load(Ordering::Acquire),
             NATIVE_CLEAR_GUARD_READY.load(Ordering::Acquire),
@@ -486,27 +549,27 @@ fn install_tasks_once(version: SupportedErVersion) {
             NATIVE_DO_SUMMON_GATE_READY.load(Ordering::Acquire),
             settings.max_active_ashes,
             settings.toggle_dismiss,
-            settings.patch_buddy_item_limits,
             settings.suppress_spirit_ash_confirmation,
             settings.suppress_additional_summon_prompt,
-            settings.clear_active_buddy_stone_link,
-            settings.temporary_pending_item_unlink,
             settings.log_enabled
         ));
     });
 }
 
 fn install_native_clear_guard() -> bool {
+    let Some(rvas) = native_rvas() else {
+        return false;
+    };
     let program = Program::current();
     let Ok(call_site) = program
-        .rva_to_va(native_rvas().clear_callsite)
+        .rva_to_va(rvas.clear_callsite)
         .map(|address| address as usize)
     else {
         log_line("native owner-group guard: call site RVA is outside the executable");
         return false;
     };
     let Ok(original) = program
-        .rva_to_va(native_rvas().clear_function)
+        .rva_to_va(rvas.clear_function)
         .map(|address| address as usize)
     else {
         log_line("native owner-group guard: original function RVA is outside the executable");
@@ -581,7 +644,6 @@ fn install_native_clear_guard() -> bool {
     }
 
     ORIGINAL_NATIVE_CLEAR_GROUPS.store(original as isize, Ordering::Release);
-    NATIVE_CLEAR_GUARD_STUB.store(stub as isize, Ordering::Release);
     unsafe {
         (&*(call_site as *const AtomicU64))
             .store(u64::from_le_bytes(patched_call), Ordering::SeqCst);
@@ -616,8 +678,8 @@ fn install_native_clear_guard() -> bool {
 
     log_line(format_args!(
         "native owner-group guard installed: call_rva={:#x} original_rva={:#x}",
-        native_rvas().clear_callsite,
-        native_rvas().clear_function
+        rvas.clear_callsite,
+        rvas.clear_function
     ));
     true
 }
@@ -627,16 +689,19 @@ fn install_native_clear_guard() -> bool {
 /// Ash group as already exiting for the duration of the native loop, so the
 /// engine runs its normal exit effect only for the selected effect group.
 fn install_native_exit_filter() -> bool {
+    let Some(rvas) = native_rvas() else {
+        return false;
+    };
     let program = Program::current();
     let Ok(function) = program
-        .rva_to_va(native_rvas().exit_function)
+        .rva_to_va(rvas.exit_function)
         .map(|address| address as usize)
     else {
         log_line("native scoped-dismissal hook: function RVA is outside the executable");
         return false;
     };
     let Ok(filter_site) = program
-        .rva_to_va(native_rvas().exit_group_filter)
+        .rva_to_va(rvas.exit_group_filter)
         .map(|address| address as usize)
     else {
         log_line("native scoped-dismissal hook: group-filter RVA is outside the executable");
@@ -742,7 +807,6 @@ fn install_native_exit_filter() -> bool {
     }
 
     ORIGINAL_NATIVE_EXIT_ROUTINE.store(trampoline as isize, Ordering::Release);
-    NATIVE_EXIT_FILTER_PAGE.store(page as isize, Ordering::Release);
     unsafe {
         (&*(function as *const AtomicU64))
             .store(u64::from_le_bytes(patched_entry), Ordering::SeqCst);
@@ -777,8 +841,8 @@ fn install_native_exit_filter() -> bool {
 
     log_line(format_args!(
         "native scoped-dismissal hook installed: function_rva={:#x} group_filter_rva={:#x}",
-        native_rvas().exit_function,
-        native_rvas().exit_group_filter
+        rvas.exit_function,
+        rvas.exit_group_filter
     ));
     true
 }
@@ -813,10 +877,29 @@ unsafe fn allocate_near(call_site: usize) -> Option<*mut c_void> {
     None
 }
 
+/// A panic must not unwind into the game's code: it is caught and the
+/// game's own clear runs as if the hook were not there.
 unsafe extern "system" fn guarded_clear_owner_groups(
     manager_ptr: *mut SummonBuddyManager,
     owner_id: i32,
 ) {
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        guarded_clear_owner_groups_inner(manager_ptr, owner_id)
+    }));
+    if guarded.is_err() {
+        if !HOOK_PANIC_REPORTED.swap(true, Ordering::Relaxed) {
+            log_line("native owner-group guard panicked: the game's clear ran unchanged");
+        }
+        let original = ORIGINAL_NATIVE_CLEAR_GROUPS.load(Ordering::Acquire);
+        if original != 0 && !manager_ptr.is_null() {
+            let clear_groups: unsafe extern "system" fn(*mut SummonBuddyManager, i32) =
+                unsafe { std::mem::transmute(original as usize) };
+            unsafe { clear_groups(manager_ptr, owner_id) };
+        }
+    }
+}
+
+unsafe fn guarded_clear_owner_groups_inner(manager_ptr: *mut SummonBuddyManager, owner_id: i32) {
     if manager_ptr.is_null() {
         return;
     }
@@ -930,13 +1013,46 @@ fn clear_owner_group_exit_requests(
 }
 
 struct NativeExitGroupBackup {
-    group: *mut SummonBuddyGroup,
+    /// The group's ChrIns address (the key to find the group again).
+    chr: usize,
     effect: Option<i32>,
     disappear_requested: bool,
     disappear_delay_sec: f32,
 }
 
+/// A panic must not unwind into the game's code: it is caught and, unless
+/// the native exit already ran, it runs now.
 unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManager) {
+    let mut native_called = false;
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        scoped_native_exit_inner(manager_ptr, &mut native_called)
+    }));
+    if guarded.is_err() {
+        if !HOOK_PANIC_REPORTED.swap(true, Ordering::Relaxed) {
+            log_line("native scoped-dismissal hook panicked: the game's exit ran instead");
+        }
+        let original = ORIGINAL_NATIVE_EXIT_ROUTINE.load(Ordering::Acquire);
+        if !native_called && original != 0 && !manager_ptr.is_null() {
+            let native_exit: unsafe extern "system" fn(*mut SummonBuddyManager) =
+                unsafe { std::mem::transmute(original as usize) };
+            unsafe { native_exit(manager_ptr) };
+        }
+    }
+}
+
+/// Live groups by their character, looked up again after a native call that
+/// may have removed groups or moved their storage.
+fn groups_by_chr(manager: &mut SummonBuddyManager) -> HashMap<usize, *mut SummonBuddyGroup> {
+    let mut groups = HashMap::new();
+    for entry in manager.groups.iter_mut() {
+        for group in entry.second.iter_mut() {
+            groups.insert(group.chr_ins.as_ptr() as usize, group as *mut SummonBuddyGroup);
+        }
+    }
+    groups
+}
+
+unsafe fn scoped_native_exit_inner(manager_ptr: *mut SummonBuddyManager, native_called: &mut bool) {
     if manager_ptr.is_null() {
         return;
     }
@@ -949,6 +1065,7 @@ unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManage
         unsafe { std::mem::transmute(original as usize) };
 
     if !NATIVE_EXIT_FILTER_READY.load(Ordering::Acquire) || !settings().enabled {
+        *native_called = true;
         unsafe { native_exit(manager_ptr) };
         return;
     }
@@ -1015,6 +1132,7 @@ unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManage
                 manager.disappear_requested
             ));
         }
+        *native_called = true;
         unsafe { native_exit(manager_ptr) };
         return;
     };
@@ -1051,7 +1169,7 @@ unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManage
                 sibling_groups_skipped += 1;
             }
             backups.push(NativeExitGroupBackup {
-                group: group as *mut SummonBuddyGroup,
+                chr: group.chr_ins.as_ptr() as usize,
                 effect,
                 disappear_requested: group.disappear_requested,
                 disappear_delay_sec: group.disappear_delay_sec,
@@ -1082,15 +1200,21 @@ unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManage
                 call_number, target_effect, requested_goods, living_effects
             ));
         }
+        let groups = groups_by_chr(manager);
         for backup in backups {
-            let group = unsafe { &mut *backup.group };
+            let Some(group) = groups.get(&backup.chr) else {
+                continue;
+            };
+            let group = unsafe { &mut **group };
             group.disappear_requested = backup.disappear_requested;
             group.disappear_delay_sec = backup.disappear_delay_sec;
         }
+        *native_called = true;
         unsafe { native_exit(manager_ptr) };
         return;
     }
 
+    *native_called = true;
     unsafe { native_exit(manager_ptr) };
 
     // The native function clears the manager's one active-stone link before
@@ -1099,9 +1223,15 @@ unsafe extern "system" fn scoped_native_exit(manager_ptr: *mut SummonBuddyManage
     let manager = unsafe { &mut *manager_ptr };
     manager.active_summmon_buddy_stone_entity_id = previous_stone_entity;
 
+    // The native exit may remove groups or move their storage: every group
+    // is found again by its character, and one that is gone is left alone.
+    let groups = groups_by_chr(manager);
     let mut target_started = 0usize;
     for backup in backups {
-        let group = unsafe { &mut *backup.group };
+        let Some(group) = groups.get(&backup.chr) else {
+            continue;
+        };
+        let group = unsafe { &mut **group };
         if backup.effect == Some(target_effect) && !repeated_call {
             if group.disappear_requested
                 && group.disappear_delay_sec.is_finite()
@@ -1293,7 +1423,6 @@ struct RuntimeState {
     native_exit_handoff: Option<NativeExitHandoff>,
     queued_native_dismissals: VecDeque<QueuedNativeDismissal>,
     last_item_cooldown_pacing_report: Option<Instant>,
-    pending_stone_restore: Option<PendingStoneRestore>,
     summon_goods_by_effect: HashMap<i32, i32>,
     summon_dialog_originals: HashMap<i32, i32>,
     /// use_limit_summon_buddy values cleared by the item-limit patch, put back
@@ -1321,13 +1450,6 @@ struct DismissalFadeBackup {
     disabled_movement: bool,
     opacity_keyframes_multiplier: f32,
     opacity_keyframes_multiplier_previous: f32,
-}
-
-struct PendingStoneRestore {
-    goods_id: i32,
-    original_effect: i32,
-    stone_entity_id: u32,
-    started_at: Instant,
 }
 
 struct NativeExitHandoff {
@@ -1365,22 +1487,63 @@ fn pace_item_use_cooldown(
     }
 }
 
+/// Set when a task panicked: the SDK calls the tasks from an `extern "C"`
+/// function, where an unwinding panic would close the game, so a panic is
+/// caught, logged and every MSA task stops for the rest of the session.
+static TASK_PANICKED: AtomicBool = AtomicBool::new(false);
+
+fn guarded_task(name: &str, task: impl FnOnce()) {
+    if TASK_PANICKED.load(Ordering::Relaxed) {
+        return;
+    }
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err()
+        && !TASK_PANICKED.swap(true, Ordering::Relaxed)
+    {
+        log_line(format_args!(
+            "task {name} panicked: Multiple Spirit Ashes stops for this session"
+        ));
+    }
+}
+
 fn timed_spirit_ash_task(data: &FD4TaskData) {
-    perf::measure(perf::POLICY, || spirit_ash_task(data));
+    guarded_task("policy", || {
+        perf::measure(perf::POLICY, || spirit_ash_task(data));
+    });
 }
 
 fn timed_allow_additional_ashes_task(data: &FD4TaskData) {
-    perf::measure(perf::ELIGIBILITY, || allow_additional_ashes_task(data));
+    guarded_task("eligibility", || {
+        perf::measure(perf::ELIGIBILITY, || allow_additional_ashes_task(data));
+    });
 }
 
 fn timed_hud_task(data: &FD4TaskData) {
-    perf::measure(perf::HUD, || hud::independent_ash_hud_task(data));
+    guarded_task("hud", || {
+        perf::measure(perf::HUD, || hud::independent_ash_hud_task(data));
+    });
+}
+
+/// The whole mod switched off: what area follow changed goes back once.
+fn release_area_follow_when_off() {
+    if !area_follow::area_follow_needs_release() {
+        return;
+    }
+    let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return;
+    };
+    let Some(manager_ptr) = summon_buddy_manager_ptr(world) else {
+        return;
+    };
+    let manager: &mut SummonBuddyManager = unsafe { &mut *manager_ptr };
+    let buddy_to_trigger = buddy_trigger_map(manager);
+    area_follow::release_area_follow(manager, &buddy_to_trigger);
 }
 
 fn spirit_ash_task(_: &FD4TaskData) {
     if !settings().enabled {
         restore_native_rows_when_off();
         stone_fallback_only();
+        release_area_follow_when_off();
         return;
     }
 
@@ -1412,9 +1575,6 @@ fn spirit_ash_task(_: &FD4TaskData) {
     let live_effects = collect_live_effects(manager, &buddy_to_trigger);
     let all_live_effects = collect_all_live_effects(manager, &buddy_to_trigger);
 
-    if !player_dead {
-        clear_active_buddy_stone_link(manager, active_effect, &live_effects);
-    }
     let Ok(mut state) = STATE.lock() else {
         return;
     };
@@ -1440,7 +1600,23 @@ fn spirit_ash_task(_: &FD4TaskData) {
     extras::log_ash_bodies(manager, world.summon_buddy_chr_set.capacity);
     extras::update_damage_by_count(manager, &buddy_to_trigger, &all_live_effects);
     if settings().follow_areas {
-        update_area_follow(manager, &buddy_to_trigger, &state.dismissed_effects, player_position);
+        let player_animation = world.main_player.as_ref().map(|player| current_animation(&player.chr_ins).0);
+        let player_orientation = world.main_player.as_ref().map(|player| {
+            let q = player.chr_ins.modules.as_ref().physics.as_ref().orientation;
+            [q.0, q.1, q.2, q.3]
+        });
+        update_area_follow(
+            manager,
+            &buddy_to_trigger,
+            &state.dismissed_effects,
+            player_position,
+            player_animation,
+            player_orientation,
+            boss_fight_active(),
+            player_riding(world),
+        );
+    } else if area_follow::area_follow_needs_release() {
+        area_follow::release_area_follow(manager, &buddy_to_trigger);
     }
     pace_item_use_cooldown(manager, &mut state, "spirit_ash_task_pre_action");
     synchronize_pending_switch_goods(manager, active_effect, &all_live_effects, &mut state);
@@ -1458,16 +1634,6 @@ fn spirit_ash_task(_: &FD4TaskData) {
             state.previous_live_effects.len()
         ));
         return;
-    }
-
-    if !player_dead {
-        temporarily_unlink_for_pending_item(
-            manager,
-            active_effect,
-            request_effect,
-            &live_effects,
-            &mut state,
-        );
     }
 
     let request_changed = request_effect != state.last_request_effect;
@@ -1699,7 +1865,8 @@ fn spirit_ash_task(_: &FD4TaskData) {
     }
 
     let now = Instant::now();
-    if state.next_report.is_none_or(|at| now >= at) {
+    // Only with the log on: the report's group snapshot is built eagerly.
+    if settings().log_enabled && state.next_report.is_none_or(|at| now >= at) {
         let report_interval = if state.previous_live_effects.is_empty() {
             Duration::from_secs(5)
         } else {
@@ -1773,8 +1940,7 @@ fn clear_buddy_item_limits_once(
     active_goods: i32,
     state: &mut RuntimeState,
 ) {
-    if !settings().patch_buddy_item_limits
-        || BUDDY_ITEM_LIMITS_PATCHED
+    if BUDDY_ITEM_LIMITS_PATCHED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
     {
@@ -2107,38 +2273,6 @@ fn update_summon_dialog_policy(
     }
 }
 
-fn clear_active_buddy_stone_link(
-    manager: &mut SummonBuddyManager,
-    active_effect: i32,
-    live_effects: &HashSet<i32>,
-) {
-    if !settings().clear_active_buddy_stone_link
-        || active_effect <= 0
-        || !live_effects.contains(&active_effect)
-    {
-        return;
-    }
-
-    let stone_entity_id = manager.active_summmon_buddy_stone_entity_id;
-    if stone_entity_id == 0 {
-        return;
-    }
-
-    // Preserve active_summon_speffect_id and active_summon_goods_id because
-    // the HUD uses the active-summon state. Only detach the single-stone link.
-    manager.active_summmon_buddy_stone_entity_id = 0;
-    let previous_effect =
-        LAST_CLEARED_BUDDY_STONE_EFFECT.swap(active_effect as isize, Ordering::Relaxed);
-    if previous_effect != active_effect as isize {
-        log_line(format_args!(
-            "buddy stone link cleared: effect={} stone_entity={} living_ashes={}",
-            active_effect,
-            stone_entity_id,
-            live_effects.len()
-        ));
-    }
-}
-
 /// Summon anywhere is its own option (Nexus, megamuni): with several ashes
 /// off both tasks still put the monument fallback in. The early one matters
 /// most: the game clears the monument every frame and checks it when an item
@@ -2301,15 +2435,6 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
                 );
             }
         }
-        if !state.dismissed_effects.contains(&request_effect) {
-            temporarily_unlink_for_pending_item(
-                manager,
-                active_effect,
-                request_effect,
-                &all_live_effects,
-                &mut state,
-            );
-        }
         observe_confirmed_vanilla_dismissal(
             manager,
             &buddy_to_trigger,
@@ -2321,8 +2446,6 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
         recover_scoped_native_handoff(manager, &buddy_to_trigger, &mut state);
         protect_existing_groups(manager, &buddy_to_trigger, &state.dismissed_effects);
     }
-    let live_effects = collect_live_effects(manager, &buddy_to_trigger);
-    clear_active_buddy_stone_link(manager, active_effect, &live_effects);
     manager.player_has_alive_summon = false;
 }
 
@@ -2456,10 +2579,27 @@ fn arm_direct_summon_guard(
     ));
 }
 
+/// The player is on Torrent (or getting on).
+fn player_riding(world: &WorldChrMan) -> bool {
+    world.main_player.as_ref().is_some_and(|player| {
+        let ride = player.chr_ins.modules.as_ref().ride.as_ref();
+        ride.is_mounted || ride.is_mounting
+    })
+}
+
+/// GameDataMan boss_fight_active: true while the game runs a boss fight.
+fn boss_fight_active() -> Option<bool> {
+    let game_data = unsafe { eldenring::cs::GameDataMan::instance() }.ok()?;
+    Some(game_data.boss_fight_active)
+}
+
 fn player_havok_position(world: &WorldChrMan) -> Option<HavokPosition> {
     let player = world.main_player.as_ref()?;
     Some(player.chr_ins.modules.as_ref().physics.as_ref().position)
 }
+
+/// A game spawn point closer than this to the player is the fresh one.
+const SPAWN_ORIGIN_KEEP_DISTANCE: f32 = 6.0;
 
 fn sync_spawn_origin_for_request(
     manager: &mut SummonBuddyManager,
@@ -2484,7 +2624,14 @@ fn sync_spawn_origin_for_request(
         return;
     };
     let previous = manager.spawn_origin;
-    manager.spawn_origin = position;
+    // 1.0.2: the game already puts the spawn point a few metres ahead of the
+    // player (2.4-3.0 m in the 1.0.1 log) when the item is used. Only a stale
+    // point (an older summon elsewhere) is moved, onto the player.
+    let horizontal = ((previous.0 - position.0).powi(2) + (previous.2 - position.2).powi(2)).sqrt();
+    let kept = horizontal <= SPAWN_ORIGIN_KEEP_DISTANCE && (previous.1 - position.1).abs() <= 2.0;
+    if !kept {
+        manager.spawn_origin = position;
+    }
     let target_effect = if request_effect > 0 {
         request_effect
     } else {
@@ -2497,12 +2644,14 @@ fn sync_spawn_origin_for_request(
     let previous_logged_effect =
         LAST_SPAWN_SYNC_EFFECT.swap(target_effect as isize, Ordering::Relaxed) as i32;
     if previous_logged_effect != target_effect
-        || (previous.0 - position.0).abs() > 0.5
-        || (previous.1 - position.1).abs() > 0.5
-        || (previous.2 - position.2).abs() > 0.5
+        || (!kept
+            && ((previous.0 - position.0).abs() > 0.5
+                || (previous.1 - position.1).abs() > 0.5
+                || (previous.2 - position.2).abs() > 0.5))
     {
         log_line(format_args!(
-            "spawn origin synchronized: source={} target_effect={} active_effect={} request_effect={} requested_goods={} previous=({:.2},{:.2},{:.2}) player=({:.2},{:.2},{:.2})",
+            "spawn origin {}: source={} target_effect={} active_effect={} request_effect={} requested_goods={} previous=({:.2},{:.2},{:.2}) player=({:.2},{:.2},{:.2}) offset={horizontal:.2}",
+            if kept { "kept (game's point ahead of the player)" } else { "synchronized" },
             source,
             target_effect,
             active_effect,
@@ -2514,73 +2663,6 @@ fn sync_spawn_origin_for_request(
             position.0,
             position.1,
             position.2
-        ));
-    }
-}
-
-fn temporarily_unlink_for_pending_item(
-    manager: &mut SummonBuddyManager,
-    active_effect: i32,
-    request_effect: i32,
-    living_effects: &HashSet<i32>,
-    state: &mut RuntimeState,
-) {
-    if !settings().temporary_pending_item_unlink {
-        return;
-    }
-
-    if let Some(pending) = state.pending_stone_restore.take() {
-        let request_accepted =
-            request_effect > 0 && manager.requested_summon_goods_id == pending.goods_id;
-        let item_became_active = manager.active_summon_goods_id == pending.goods_id;
-        let item_cancelled = manager.requested_summon_goods_id == manager.active_summon_goods_id;
-        let original_gone = !living_effects.contains(&pending.original_effect);
-        let timed_out = pending.started_at.elapsed() >= Duration::from_secs(4);
-        if request_accepted || item_became_active || item_cancelled || original_gone || timed_out {
-            if !original_gone
-                && manager.active_summmon_buddy_stone_entity_id == 0
-                && (request_accepted || item_became_active || item_cancelled || timed_out)
-            {
-                manager.active_summmon_buddy_stone_entity_id = pending.stone_entity_id;
-            }
-            log_line(format_args!(
-                "pending item stone link restored: goods={} original_effect={} request_effect={} active_goods={} original_alive={} timeout={} stone_entity={}",
-                pending.goods_id,
-                pending.original_effect,
-                request_effect,
-                manager.active_summon_goods_id,
-                !original_gone,
-                timed_out,
-                manager.active_summmon_buddy_stone_entity_id
-            ));
-        } else {
-            state.pending_stone_restore = Some(pending);
-        }
-        return;
-    }
-
-    let active_goods = manager.active_summon_goods_id;
-    let requested_goods = manager.requested_summon_goods_id;
-    let stone_entity_id = manager.active_summmon_buddy_stone_entity_id;
-    if request_effect <= 0
-        && active_effect > 0
-        && living_effects.contains(&active_effect)
-        && !manager.disappear_requested
-        && active_goods > 0
-        && requested_goods > 0
-        && requested_goods != active_goods
-        && stone_entity_id != 0
-    {
-        state.pending_stone_restore = Some(PendingStoneRestore {
-            goods_id: requested_goods,
-            original_effect: active_effect,
-            stone_entity_id,
-            started_at: Instant::now(),
-        });
-        manager.active_summmon_buddy_stone_entity_id = 0;
-        log_line(format_args!(
-            "pending item stone link temporarily cleared: goods={} active_effect={} active_goods={} stone_entity={}",
-            requested_goods, active_effect, active_goods, stone_entity_id
         ));
     }
 }
@@ -3728,30 +3810,84 @@ fn apply_item_action(
 /// checks failed (Nexus report at +10). The level in use is the effect the
 /// game reports as active or requested, matched to its +0 entry (the same
 /// effect or up to 10 below it) and remembered per BuddyParam.
-pub(crate) fn buddy_trigger_map(manager: &SummonBuddyManager) -> HashMap<i32, i32> {
-    let mut mapping = HashMap::with_capacity(manager.trigger_speffect_to_buddy_map.len());
+/// The game's trigger map read once per manager (it only changes with the
+/// params), plus the last result while the upgrade levels in use stay the
+/// same: callers several times a frame share one map instead of rebuilding
+/// it from the whole trigger map.
+struct TriggerMapCache {
+    /// Manager address and trigger map length the base maps come from.
+    source: (usize, usize),
+    /// BuddyParam -> its first trigger effect.
+    base: HashMap<i32, i32>,
+    /// Trigger effect -> BuddyParam.
+    buddy_of: HashMap<i32, i32>,
+    /// Bumped whenever TRIGGER_IN_USE changes.
+    in_use_changes: u64,
+    /// in_use_changes when `result` was built (None: not built yet).
+    result_at: Option<u64>,
+    result: Arc<HashMap<i32, i32>>,
+}
+
+static TRIGGER_MAP_CACHE: Mutex<Option<TriggerMapCache>> = Mutex::new(None);
+
+fn trigger_base_maps(manager: &SummonBuddyManager) -> (HashMap<i32, i32>, HashMap<i32, i32>) {
+    let mut base = HashMap::with_capacity(manager.trigger_speffect_to_buddy_map.len());
     let mut buddy_of = HashMap::with_capacity(manager.trigger_speffect_to_buddy_map.len());
     for (trigger_effect, buddy_param_id) in manager.trigger_speffect_to_buddy_map.iter() {
         if *trigger_effect > 0 && *buddy_param_id > 0 {
-            mapping.entry(*buddy_param_id).or_insert(*trigger_effect);
+            base.entry(*buddy_param_id).or_insert(*trigger_effect);
             buddy_of.insert(*trigger_effect, *buddy_param_id);
         }
     }
+    (base, buddy_of)
+}
+
+/// BuddyParam -> the trigger effect of the Ash summoned with it, at the
+/// upgrade level in use.
+pub(crate) fn buddy_trigger_map(manager: &SummonBuddyManager) -> Arc<HashMap<i32, i32>> {
+    let source = (
+        std::ptr::from_ref(manager) as usize,
+        manager.trigger_speffect_to_buddy_map.len(),
+    );
+    let Ok(mut guard) = TRIGGER_MAP_CACHE.lock() else {
+        return Arc::new(trigger_base_maps(manager).0);
+    };
+    if guard.as_ref().is_none_or(|cache| cache.source != source) {
+        let (base, buddy_of) = trigger_base_maps(manager);
+        *guard = Some(TriggerMapCache {
+            source,
+            base,
+            buddy_of,
+            in_use_changes: 0,
+            result_at: None,
+            result: Arc::default(),
+        });
+    }
+    let Some(cache) = guard.as_mut() else {
+        return Arc::new(trigger_base_maps(manager).0);
+    };
     let Ok(mut in_use) = TRIGGER_IN_USE.lock() else {
-        return mapping;
+        return Arc::new(cache.base.clone());
     };
     let active = i32::try_from(manager.active_summon_speffect_id).unwrap_or(0);
     for effect in [active, manager.request_summon_speffect_id] {
-        if let Some((buddy, _)) = upgrade_base(&buddy_of, effect) {
-            in_use.insert(buddy, effect);
+        if let Some((buddy, _)) = upgrade_base(&cache.buddy_of, effect)
+            && in_use.insert(buddy, effect) != Some(effect)
+        {
+            cache.in_use_changes += 1;
         }
     }
-    for (buddy, effect) in in_use.iter() {
-        if upgrade_base(&buddy_of, *effect).map(|(found, _)| found) == Some(*buddy) {
-            mapping.insert(*buddy, *effect);
+    if cache.result_at != Some(cache.in_use_changes) {
+        let mut mapping = cache.base.clone();
+        for (buddy, effect) in in_use.iter() {
+            if upgrade_base(&cache.buddy_of, *effect).map(|(found, _)| found) == Some(*buddy) {
+                mapping.insert(*buddy, *effect);
+            }
         }
+        cache.result = Arc::new(mapping);
+        cache.result_at = Some(cache.in_use_changes);
     }
-    mapping
+    Arc::clone(&cache.result)
 }
 
 /// The BuddyParam and +0 trigger effect of an Ash's trigger effect at any
@@ -3826,19 +3962,16 @@ struct Settings {
     toggle_dismiss: bool,
     /// See NtMsaSettings::repeat_same_ash.
     repeat_same_ash: bool,
-    patch_buddy_item_limits: bool,
     suppress_spirit_ash_confirmation: bool,
     suppress_additional_summon_prompt: bool,
-    clear_active_buddy_stone_link: bool,
-    temporary_pending_item_unlink: bool,
     patch_hud_movie: bool,
     start_delay_ms: u64,
     log_enabled: bool,
 }
 
 impl Settings {
-    /// The standalone mod's shipped INI; NativeTweaks overrides enabled,
-    /// max_active_ashes and log_enabled.
+    /// Before the first nt_msa_start / nt_msa_set: off. NativeTweaks and the
+    /// standalone DLL (from its INI) set every NtMsaSettings field.
     const DEFAULT: Self = Self {
         enabled: false,
         follow_areas: true,
@@ -3849,11 +3982,8 @@ impl Settings {
         max_active_ashes: 8,
         toggle_dismiss: true,
         repeat_same_ash: false,
-        patch_buddy_item_limits: true,
         suppress_spirit_ash_confirmation: false,
         suppress_additional_summon_prompt: true,
-        clear_active_buddy_stone_link: false,
-        temporary_pending_item_unlink: false,
         patch_hud_movie: true,
         start_delay_ms: 2500,
         log_enabled: false,
@@ -3879,7 +4009,7 @@ pub(crate) fn hud_rows_active() -> bool {
 }
 
 pub(crate) fn log_line(message: impl std::fmt::Display) {
-    if !settings().log_enabled {
+    if !settings().log_enabled || LOG_OPEN_FAILED.load(Ordering::Relaxed) {
         return;
     }
     let Ok(mut guard) = LOG.lock() else {
@@ -3895,6 +4025,10 @@ pub(crate) fn log_line(message: impl std::fmt::Display) {
             return;
         };
         *guard = OpenOptions::new().create(true).append(true).open(path).ok();
+        if guard.is_none() {
+            LOG_OPEN_FAILED.store(true, Ordering::Relaxed);
+            return;
+        }
     }
     if let Some(file) = guard.as_mut() {
         let _ = writeln!(file, "{message}");
