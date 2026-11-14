@@ -9,6 +9,7 @@ mod hud_movie;
 #[cfg(feature = "melina")]
 mod melina;
 mod native_prompt;
+mod npc;
 mod perf;
 mod solid;
 

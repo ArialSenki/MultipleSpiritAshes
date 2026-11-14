@@ -22,12 +22,14 @@ static CARRIER_READY: AtomicBool = AtomicBool::new(false);
 static LAST_APPLIED: Mutex<Option<Instant>> = Mutex::new(None);
 static INSTALL: Mutex<()> = Mutex::new(());
 static INSTALLED: AtomicBool = AtomicBool::new(false);
-/// A SpEffect the Hub wants on the player all the time (Damage taken, r157:
-/// its own SpEffectParam row with the incoming damage rates); 0 = none.
-static KEPT_EFFECT: AtomicI32 = AtomicI32::new(0);
-/// The one last put on the player, to take it off when the Hub stops.
-static KEPT_APPLIED: AtomicI32 = AtomicI32::new(0);
-static KEPT_CHECKED: Mutex<Option<Instant>> = Mutex::new(None);
+/// SpEffects the Hub wants on the player all the time, one per slot; 0 = none.
+/// Slot 0: Damage taken / dealt (r157, its own SpEffectParam row). Slot 1:
+/// the Deathbed Dress aura (r158, Healing aura).
+const KEPT_SLOTS: usize = 2;
+static KEPT_EFFECT: [AtomicI32; KEPT_SLOTS] = [AtomicI32::new(0), AtomicI32::new(0)];
+/// The one last put on the player per slot, to take it off when the Hub stops.
+static KEPT_APPLIED: [AtomicI32; KEPT_SLOTS] = [AtomicI32::new(0), AtomicI32::new(0)];
+static KEPT_CHECKED: [Mutex<Option<Instant>>; KEPT_SLOTS] = [Mutex::new(None), Mutex::new(None)];
 
 /// Turns the cleaning on or off. Returns 1 when the frame task runs, 0 when
 /// the game's task scheduler isn't there yet (the Hub asks again).
@@ -52,7 +54,14 @@ pub extern "C" fn nt_set_player_clean(enabled: u8) -> u8 {
 /// 1 when the frame task runs, 0 when it can't run yet (ask again).
 #[unsafe(no_mangle)]
 pub extern "C" fn nt_keep_player_effect(id: i32) -> u8 {
-    KEPT_EFFECT.store(id.max(0), Ordering::Release);
+    nt_keep_player_effect_slot(0, id)
+}
+
+/// The same for slot `slot` (0 or 1): each slot keeps one SpEffect of its own.
+#[unsafe(no_mangle)]
+pub extern "C" fn nt_keep_player_effect_slot(slot: u32, id: i32) -> u8 {
+    let Some(want) = KEPT_EFFECT.get(slot as usize) else { return 0 };
+    want.store(id.max(0), Ordering::Release);
     if supported_version(Program::current()).is_none() {
         return 0;
     }
@@ -63,16 +72,18 @@ pub extern "C" fn nt_keep_player_effect(id: i32) -> u8 {
 fn clean_task(_: &FD4TaskData) {
     // A panic must not unwind into the game's task loop.
     let _ = std::panic::catch_unwind(update_clean);
-    let _ = std::panic::catch_unwind(update_kept_effect);
+    for slot in 0..KEPT_SLOTS {
+        let _ = std::panic::catch_unwind(|| update_kept_effect(slot));
+    }
 }
 
-fn update_kept_effect() {
-    let want = KEPT_EFFECT.load(Ordering::Acquire);
-    let applied = KEPT_APPLIED.load(Ordering::Acquire);
+fn update_kept_effect(slot: usize) {
+    let want = KEPT_EFFECT[slot].load(Ordering::Acquire);
+    let applied = KEPT_APPLIED[slot].load(Ordering::Acquire);
     if want == 0 && applied == 0 {
         return;
     }
-    let mut checked = KEPT_CHECKED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut checked = KEPT_CHECKED[slot].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if want == applied && checked.is_some_and(|at| at.elapsed() < INTERVAL) {
         return;
     }
@@ -96,7 +107,7 @@ fn update_kept_effect() {
             log_line(format_args!("kept player effect: SpEffect {want} applied"));
         }
     }
-    KEPT_APPLIED.store(want, Ordering::Release);
+    KEPT_APPLIED[slot].store(want, Ordering::Release);
     *checked = Some(Instant::now());
 }
 
