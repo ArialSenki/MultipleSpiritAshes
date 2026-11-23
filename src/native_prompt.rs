@@ -496,6 +496,20 @@ unsafe fn write_code_bytes(address: usize, patch: &[u8]) {
     if unsafe { store_within_qword(address, patch) } {
         return;
     }
+    // Only the bytes that change need to go in atomically: a call whose
+    // target moves keeps its E8, and its rel32 often fits one aligned block.
+    let current = unsafe { std::slice::from_raw_parts(address as *const u8, patch.len()) };
+    if let (Some(first), Some(last)) = (
+        patch.iter().zip(current).position(|(new, old)| new != old),
+        patch.iter().zip(current).rposition(|(new, old)| new != old),
+    ) {
+        if unsafe { store_within_qword(address + first, &patch[first..=last]) } {
+            flush(patch.len());
+            return;
+        }
+    } else {
+        return; // already in place
+    }
     if patch.len() > 2 && unsafe { store_within_qword(address, &[0xeb, 0xfe]) } {
         flush(2);
         unsafe {
@@ -621,8 +635,15 @@ pub(crate) fn update_native_prompt_flags(
     // an Ash summoned while no other was alive.
     // Summoning the same Ash again: a living Ash's item is a new summon here.
     let repeat = settings().repeat_same_ash;
+    // Lord of Ashes' Desummon box (another goods ID calling a living Ash's
+    // effect) is that Ash too: taken as a new Ash, the DoSummon gate turned
+    // the game's dismissal (state 2) into a summon and the box did nothing
+    // (23-11, r159-test13: gate_last_state=2 gate_route=1, Ash still there).
     let goods_is_living = |goods_id: i32| {
-        !repeat && (active_goods_ids.contains(&goods_id) || live_effects.contains(&goods_id))
+        !repeat
+            && (active_goods_ids.contains(&goods_id)
+                || live_effects.contains(&goods_id)
+                || alias_of_living_ash(goods_id, live_effects))
     };
     let requested_goods_is_living = goods_is_living(requested_goods);
     // The 0.1.56 policy decides "new" from its goods map only, so it can call
@@ -912,9 +933,8 @@ fn update_living_ash_low_fp_costs(
 
 /// Feature switched off: every consumeMP set to 0 above gets its value back.
 fn restore_living_ash_low_fp_costs() {
-    let Ok(mut overrides) = LOW_FP_COST_OVERRIDES.lock() else {
-        return;
-    };
+    // Also after a panic poisoned the lock: the original costs must come back.
+    let mut overrides = LOW_FP_COST_OVERRIDES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if overrides.is_empty() {
         return;
     }

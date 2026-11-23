@@ -63,6 +63,16 @@ static LAST_FREE_SLOTS: AtomicUsize = AtomicUsize::new(ROW_SLOTS);
 
 static HUD_STATE: LazyLock<Mutex<HudState>> = LazyLock::new(|| Mutex::new(HudState::default()));
 
+/// After a task panic: the hook stops drawing Ash rows (also when a panic
+/// poisoned the lock).
+pub(crate) fn clear_rows_after_panic() {
+    match HUD_STATE.try_lock() {
+        Ok(mut state) => state.ashes.clear(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().ashes.clear(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+}
+
 #[derive(Default)]
 struct HudState {
     /// Effects of the living Ashes, oldest first.
@@ -153,8 +163,11 @@ fn build_tag_copy_stub(_original_target: usize) -> Vec<u8> {
 
 unsafe extern "system" fn tag_copy_detour(fe_manager: *mut CSFeManImp, delta: f32) {
     let original = ORIGINAL_TAG_COPY.load(Ordering::Acquire);
-    let written = std::panic::catch_unwind(|| unsafe { insert_rows(fe_manager) })
-        .unwrap_or([false; ROW_SLOTS]);
+    // Filled as entries are written, so a panic half-way still removes them.
+    let mut written = [false; ROW_SLOTS];
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        insert_rows(fe_manager, &mut written)
+    }));
     if original != 0 {
         let original: TagCopyFn = unsafe { std::mem::transmute(original) };
         unsafe { original(fe_manager, delta) };
@@ -162,19 +175,18 @@ unsafe extern "system" fn tag_copy_detour(fe_manager: *mut CSFeManImp, delta: f3
     let _ = std::panic::catch_unwind(|| unsafe { remove_rows(fe_manager, &written) });
 }
 
-/// Writes the rows into the free friendly entries; returns which ones.
-unsafe fn insert_rows(fe_manager: *mut CSFeManImp) -> [bool; ROW_SLOTS] {
-    let mut written = [false; ROW_SLOTS];
+/// Writes the rows into the free friendly entries; marks which ones.
+unsafe fn insert_rows(fe_manager: *mut CSFeManImp, written: &mut [bool; ROW_SLOTS]) {
     if fe_manager.is_null() {
-        return written;
+        return;
     }
     // Never wait inside the game's HUD call: if the task holds the state
     // right now, this copy shows no rows (the next one does).
     let Ok(state) = HUD_STATE.try_lock() else {
-        return written;
+        return;
     };
     if state.ashes.is_empty() {
-        return written;
+        return;
     }
     let displays = unsafe { &mut (*fe_manager).friendly_chr_tag_displays };
     let free = (0..ROW_SLOTS)
@@ -189,7 +201,6 @@ unsafe fn insert_rows(fe_manager: *mut CSFeManImp) -> [bool; ROW_SLOTS] {
             clear_entry(entry);
         }
     }
-    written
 }
 
 unsafe fn remove_rows(fe_manager: *mut CSFeManImp, written: &[bool; ROW_SLOTS]) {

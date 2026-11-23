@@ -88,6 +88,88 @@ pub(crate) fn take_dismiss_all_request(
     ));
 }
 
+/// The kind of a spirit Ash by its summon item (the trigger effect is the
+/// item's id: refId_default = goods id in 2.7.x): Some(true) renowned
+/// (goodsType 8, Ghost Glovewort), Some(false) regular (goodsType 7).
+pub(crate) fn ash_is_renowned(effect: i32) -> Option<bool> {
+    if effect <= 0 {
+        return None;
+    }
+    let repository = unsafe { SoloParamRepository::instance().ok()? };
+    match repository.get::<EquipParamGoods>(effect as u32)?.goods_type() {
+        7 => Some(false),
+        8 => Some(true),
+        _ => None,
+    }
+}
+
+/// Most living Ashes of each kind (Nexus request, PoisonParadise): when a new
+/// Ash is requested and its kind is full, one living Ash of that kind leaves
+/// with the dismissal fade, so the new one takes its place and the others
+/// stay. Runs where the early item task sees a new summon request, before the
+/// clear guard is armed.
+pub(crate) fn make_room_in_kind(
+    manager: &mut SummonBuddyManager,
+    buddy_to_trigger: &HashMap<i32, i32>,
+    requested_effect: i32,
+    state: &mut RuntimeState,
+) {
+    let (regular_cap, renowned_cap) = (settings().max_regular_ashes, settings().max_renowned_ashes);
+    if regular_cap == 0 && renowned_cap == 0 {
+        return;
+    }
+    let Some(renowned) = ash_is_renowned(requested_effect) else {
+        return;
+    };
+    let cap = if renowned { renowned_cap } else { regular_cap };
+    if cap == 0 {
+        return;
+    }
+    // Living Ashes of the same kind, in group order (the oldest first).
+    let mut same_kind: Vec<i32> = Vec::new();
+    for entry in manager.groups.iter() {
+        for group in entry.second.iter() {
+            let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
+                continue;
+            };
+            if group.is_remote
+                || group.disappear_requested
+                || effect == requested_effect
+                || state.dismissed_effects.contains(&effect)
+                || same_kind.contains(&effect)
+                || !chr_alive(unsafe { group.chr_ins.as_ref() })
+                || ash_is_renowned(effect) != Some(renowned)
+            {
+                continue;
+            }
+            same_kind.push(effect);
+        }
+    }
+    if same_kind.len() < cap {
+        return;
+    }
+    let leaving = &same_kind[..same_kind.len() + 1 - cap];
+    for entry in manager.groups.iter_mut() {
+        for group in entry.second.iter_mut() {
+            let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
+                continue;
+            };
+            if !group.is_remote && leaving.contains(&effect) && !group.disappear_requested {
+                group.disappear_delay_sec = DISMISS_FADE_SECONDS;
+                group.disappear_requested = true;
+            }
+        }
+    }
+    state.dismissed_effects.extend(leaving.iter().copied());
+    log_line(format_args!(
+        "kind full: new {} ash {} (cap {}), dismissed {:?}",
+        if renowned { "renowned" } else { "regular" },
+        requested_effect,
+        cap,
+        leaving
+    ));
+}
+
 /// Goods of the pending new Ash whose consumeMP was scaled: (original, written).
 static EXTRA_COST_OVERRIDES: LazyLock<Mutex<HashMap<i32, (i16, i16)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -150,6 +232,167 @@ pub(crate) fn update_extra_ash_cost(live_effects: &HashSet<i32>, active_goods_id
             "additional Ash cost: goods={goods_id} fp={original} -> {scaled} ({percent}%)"
         ));
     }
+}
+
+/// Cost-hook restores seen at the last forwarded summon: if the counter moved
+/// since, the game charged that summon itself.
+static COST_RESTORED_AT_LAST_FORWARD: AtomicU64 = AtomicU64::new(0);
+
+/// An additional Ash summoned through the forwarded switch request (another
+/// Ash alive) skipped the game's item use, so it was free: no FP, no HP (Nexus,
+/// ern5487, seen with Lord of Ashes; the same for every extra Ash, 21-11 log:
+/// FP 13 before and after). Charge its consumeMP (with Cost of additional Ashes)
+/// and consumeHP here, unless the cost hooks already let the game charge it.
+pub(crate) fn charge_forwarded_summon(goods_id: i32) {
+    charge_extra_summon(goods_id, true);
+}
+
+/// Game decides (summoned flag kept): the game's own path spends a consumable
+/// Ash itself, FP included; only a plain Ash is charged here.
+pub(crate) fn charge_native_extra_summon(goods_id: i32) {
+    let consumable = u32::try_from(goods_id)
+        .ok()
+        .and_then(|goods| {
+            let repository = unsafe { SoloParamRepository::instance() }.ok()?;
+            repository.get::<EquipParamGoods>(goods).map(|row| row.is_consume())
+        })
+        .unwrap_or(true);
+    if consumable {
+        return;
+    }
+    charge_extra_summon(goods_id, false);
+}
+
+fn charge_extra_summon(goods_id: i32, swap_item: bool) {
+    let restored = super::native_prompt::NATIVE_SUMMON_COST_RESTORED_CALLS.load(Ordering::Acquire);
+    if COST_RESTORED_AT_LAST_FORWARD.swap(restored, Ordering::AcqRel) != restored {
+        log_line(format_args!("extra summon cost: goods={goods_id} charged by the game"));
+        return;
+    }
+    let Ok(goods) = u32::try_from(goods_id) else {
+        return;
+    };
+    let Ok(repository) = (unsafe { SoloParamRepository::instance() }) else {
+        return;
+    };
+    let Some(row) = repository.get::<EquipParamGoods>(goods) else {
+        return;
+    };
+    // A scaled row (update_extra_ash_cost) already holds the extra-cost value.
+    let scaled = EXTRA_COST_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|overrides| overrides.get(&goods_id).copied())
+        .is_some_and(|(_, written)| written == row.consume_mp());
+    let mut fp_cost = i64::from(row.consume_mp().max(0));
+    if !scaled {
+        fp_cost = fp_cost * i64::from(settings().extra_cost_percent) / 100;
+    }
+    let hp_cost = i64::from(row.consume_hp().max(0));
+    if fp_cost == 0 && hp_cost == 0 {
+        return;
+    }
+    let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return;
+    };
+    let Some(player) = world.main_player.as_deref_mut() else {
+        return;
+    };
+    let data = &mut player.chr_ins.modules.data;
+    let fp_before = data.fp;
+    let hp_before = data.hp;
+    data.fp = (i64::from(data.fp) - fp_cost).max(0) as i32;
+    if hp_cost > 0 && data.hp > 1 {
+        data.hp = (i64::from(data.hp) - hp_cost).max(1) as i32;
+    }
+    log_line(format_args!(
+        "extra summon cost ({}): goods={goods_id} fp {fp_before}->{} hp {hp_before}->{}",
+        if swap_item { "forwarded" } else { "native" },
+        data.fp, data.hp
+    ));
+    let (consume, replace) = (row.is_consume(), row.replace_item_id());
+    if swap_item {
+        consume_forwarded_ash_item(player, goods_id, consume, replace);
+    }
+}
+
+/// The item side of an Ash that is used up when summoned (Lord of Ashes: each
+/// Ash is a box, like a flask, that turns into its empty "Desummon" row,
+/// replaceItemId, and refills at a grace). The game does that in its item use,
+/// which the forwarded summon skips, so it is done here the way the game
+/// swaps a flask: same inventory slot, new item, quick and pouch slots follow.
+/// Anything unexpected leaves the inventory alone (logged).
+fn consume_forwarded_ash_item(
+    player: &mut eldenring::cs::PlayerIns,
+    goods_id: i32,
+    consume: bool,
+    replace: i32,
+) {
+    use eldenring::cs::ItemId;
+    if !consume {
+        return;
+    }
+    let (Ok(goods), Ok(replace_goods)) = (u32::try_from(goods_id), u32::try_from(replace)) else {
+        log_line(format_args!("forwarded summon item: goods={goods_id} consumable without a replacement; left as is"));
+        return;
+    };
+    let (Ok(old_id), Ok(new_id)) = (
+        ItemId::new(ItemCategory::Goods, goods),
+        ItemId::new(ItemCategory::Goods, replace_goods),
+    ) else {
+        return;
+    };
+    let game_data = unsafe { player.player_game_data.as_mut() };
+    let equipment = &mut game_data.equipment;
+    let items = &mut equipment.equip_inventory_data.items_data;
+    let Some(slot) = items.find_item_idx(old_id) else {
+        log_line(format_args!("forwarded summon item: goods={goods_id} not in the inventory"));
+        return;
+    };
+    if items.find_item_idx(new_id).is_some() {
+        log_line(format_args!("forwarded summon item: goods={goods_id} -> {replace} already held; left as is"));
+        return;
+    }
+    let Some(entry) = items.entry_at_slot_mut(slot).and_then(|entry| entry.as_option_mut()) else {
+        return;
+    };
+    if entry.quantity > 1 {
+        entry.quantity -= 1;
+        log_line(format_args!("forwarded summon item: goods={goods_id} quantity -> {}", entry.quantity));
+        return;
+    }
+    let old_handle = entry.gaitem_handle;
+    if old_handle.is_indexed() || old_handle.selector() != goods {
+        log_line(format_args!(
+            "forwarded summon item: goods={goods_id} handle {old_handle} not a plain goods handle; left as is"
+        ));
+        return;
+    }
+    let Ok(category) = old_handle.category() else {
+        return;
+    };
+    let new_handle = eldenring::cs::GaitemHandle::from_parts(replace_goods, category);
+    if new_handle.category().ok() != Some(category) || new_handle.selector() != replace_goods {
+        return;
+    }
+    entry.item_id = new_id;
+    entry.gaitem_handle = new_handle;
+    let Ok(slot_index) = i16::try_from(slot) else {
+        return;
+    };
+    items.remove_item_id_mapping(old_id);
+    items.update_item_id_mapping(new_id, slot_index);
+    let mut slots_moved = 0usize;
+    let item_data = &mut equipment.equip_item_data;
+    for equipped in item_data.quick_slots.iter_mut().chain(item_data.pouch_slots.iter_mut()) {
+        if equipped.gaitem_handle == old_handle {
+            equipped.gaitem_handle = new_handle;
+            slots_moved += 1;
+        }
+    }
+    log_line(format_args!(
+        "forwarded summon item: goods={goods_id} -> {replace} (inventory slot {slot}, {slots_moved} equipped slots)"
+    ));
 }
 
 /// Feature switched off: every scaled consumeMP gets its value back.
@@ -513,6 +756,7 @@ fn nearest_stone() -> Option<u32> {
 }
 
 pub(crate) fn apply_stone_fallback(manager: &mut SummonBuddyManager) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| keep_summon_active_effect(manager)));
     if !SUMMON_ANYWHERE.load(Ordering::Relaxed) {
         return;
     }
@@ -533,6 +777,104 @@ pub(crate) fn apply_stone_fallback(manager: &mut SummonBuddyManager) {
         log_line(format_args!(
             "summon anywhere: no monument found here; using monument {stone}"
         ));
+    }
+}
+
+/// «Spirit Summon Active» (r159-test15). SpEffectParam 9540 (vanilla, Lord of
+/// Ashes 1.3.10 and Reforged alike): permanent (-1), on the player only,
+/// spCategory 100, no stat change, no VFX, not saved; its one job is state
+/// 411. Lord of Ashes' Desummon box (enableSp 411), its Ash Enhancement event
+/// (waits for 9540) and Reforged's enragement (its 9540 also cycles 5002095)
+/// need it, and nothing in the regulation, EMEVD or exe puts it on a player
+/// whose Ash came from Summon anywhere (r159-test14: never there away from a
+/// monument). With Summon anywhere on, the player gets it while a local Ash
+/// lives and doesn't have it already; it is taken off once no Ash lives, only
+/// if it was put on here. With the option off nothing is touched (one that was
+/// put on here is still taken off).
+const SUMMON_ACTIVE_SP_EFFECT: i32 = 9540;
+const SUMMON_ACTIVE_CHECK: Duration = Duration::from_millis(200);
+static SUMMON_ACTIVE_APPLIED: AtomicBool = AtomicBool::new(false);
+static SUMMON_ACTIVE_CHECKED: Mutex<Option<Instant>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SummonActiveAction {
+    Nothing,
+    /// Put 9540 on the player and remember it was ours.
+    Apply,
+    /// Take ours off.
+    Remove,
+    /// Ours is gone already (death, load, the game took it): forget it.
+    Forget,
+}
+
+pub(crate) fn summon_active_action(
+    anywhere: bool,
+    ash_alive: bool,
+    player_has_effect: bool,
+    applied_here: bool,
+) -> SummonActiveAction {
+    if anywhere && ash_alive {
+        return if player_has_effect { SummonActiveAction::Nothing } else { SummonActiveAction::Apply };
+    }
+    match (applied_here, player_has_effect) {
+        (true, true) => SummonActiveAction::Remove,
+        (true, false) => SummonActiveAction::Forget,
+        _ => SummonActiveAction::Nothing,
+    }
+}
+
+fn keep_summon_active_effect(manager: &SummonBuddyManager) {
+    let anywhere = SUMMON_ANYWHERE.load(Ordering::Relaxed);
+    let applied = SUMMON_ACTIVE_APPLIED.load(Ordering::Acquire);
+    if !anywhere && !applied {
+        return;
+    }
+    {
+        let mut checked = SUMMON_ACTIVE_CHECKED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if checked.is_some_and(|at| at.elapsed() < SUMMON_ACTIVE_CHECK) {
+            return;
+        }
+        *checked = Some(Instant::now());
+    }
+    let ash_alive = manager
+        .groups
+        .iter()
+        .flat_map(|entry| entry.second.iter())
+        .any(|group| !group.is_remote && !group.disappear_requested && chr_alive(unsafe { group.chr_ins.as_ref() }));
+    let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
+        return;
+    };
+    let Some(player) = world.main_player.as_mut() else {
+        return;
+    };
+    let has = player
+        .chr_ins
+        .special_effect
+        .as_ref()
+        .entries()
+        .any(|entry| entry.param_id == SUMMON_ACTIVE_SP_EFFECT);
+    match summon_active_action(anywhere, ash_alive, has, applied) {
+        SummonActiveAction::Nothing => {}
+        SummonActiveAction::Apply => {
+            player.apply_speffect(SUMMON_ACTIVE_SP_EFFECT, true);
+            SUMMON_ACTIVE_APPLIED.store(true, Ordering::Release);
+            log_line(format_args!(
+                "summon anywhere: SpEffect {SUMMON_ACTIVE_SP_EFFECT} (Spirit Summon Active, state 411) put on the player; the game had not"
+            ));
+        }
+        SummonActiveAction::Remove => {
+            player.remove_speffect(SUMMON_ACTIVE_SP_EFFECT);
+            SUMMON_ACTIVE_APPLIED.store(false, Ordering::Release);
+            log_line(format_args!(
+                "summon anywhere: no Ash alive; SpEffect {SUMMON_ACTIVE_SP_EFFECT} taken off the player"
+            ));
+        }
+        SummonActiveAction::Forget => {
+            SUMMON_ACTIVE_APPLIED.store(false, Ordering::Release);
+            log_line(format_args!(
+                "summon anywhere: SpEffect {SUMMON_ACTIVE_SP_EFFECT} already gone from the player"
+            ));
+        }
     }
 }
 
@@ -588,7 +930,7 @@ fn release_used_monument(manager: &mut SummonBuddyManager) {
         .groups
         .iter()
         .flat_map(|entry| entry.second.iter())
-        .any(|group| chr_alive(unsafe { group.chr_ins.as_ref() }));
+        .any(|group| !group.is_remote && chr_alive(unsafe { group.chr_ins.as_ref() }));
     if any_alive {
         return;
     }
@@ -638,4 +980,28 @@ pub(crate) fn update_ash_cost(state: &RuntimeState) {
     }
     ASH_COST_APPLIED.store(true, Ordering::Release);
     log_line(format_args!("spirit ash cost: {percent}% on {rows} Spirit Ash items"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SummonActiveAction as A, summon_active_action};
+
+    #[test]
+    fn summon_active_effect_follows_living_ashes_with_summon_anywhere() {
+        // option on, an Ash alive: put it on only when the player lacks it
+        assert_eq!(summon_active_action(true, true, false, false), A::Apply);
+        assert_eq!(summon_active_action(true, true, false, true), A::Apply);
+        assert_eq!(summon_active_action(true, true, true, false), A::Nothing);
+        assert_eq!(summon_active_action(true, true, true, true), A::Nothing);
+        // no Ash alive: take off only ours
+        assert_eq!(summon_active_action(true, false, true, true), A::Remove);
+        assert_eq!(summon_active_action(true, false, true, false), A::Nothing);
+        assert_eq!(summon_active_action(true, false, false, true), A::Forget);
+        assert_eq!(summon_active_action(true, false, false, false), A::Nothing);
+        // option off: never put on; one of ours still comes off
+        assert_eq!(summon_active_action(false, true, false, false), A::Nothing);
+        assert_eq!(summon_active_action(false, true, true, false), A::Nothing);
+        assert_eq!(summon_active_action(false, true, true, true), A::Remove);
+        assert_eq!(summon_active_action(false, false, false, true), A::Forget);
+    }
 }

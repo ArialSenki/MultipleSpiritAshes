@@ -4,6 +4,7 @@ mod deflect;
 mod engine_patches;
 mod extras;
 mod game_menus;
+mod game_thread;
 mod hud;
 mod hud_movie;
 #[cfg(feature = "melina")]
@@ -43,6 +44,7 @@ use fromsoftware_shared::{
     FromStatic, GameVersion, LANG_ID_EN, LANG_ID_JP, SharedTaskImpExt, Superclass, program::Program,
 };
 use area_follow::update_area_follow;
+pub use game_thread::{nt_msa_game_thread_ready, nt_msa_on_game_thread};
 pub use extras::{nt_msa_dismiss_all, nt_msa_set_ash_cost_percent, nt_msa_set_buddy_stone_rules};
 pub use engine_patches::nt_msa_engine_patches;
 pub use game_menus::{nt_game_menu_last_result, nt_open_game_menu};
@@ -283,6 +285,12 @@ pub struct NtMsaSettings {
     /// Using a summoned Ash's item summons it once more instead of
     /// dismissing it (the same Ash several times; Dismiss all removes them).
     pub repeat_same_ash: u8,
+    /// Most living Ashes of each kind (0 = no limit): regular ones (upgraded
+    /// with Grave Glovewort, EquipParamGoods goodsType 7) and renowned ones
+    /// (Ghost Glovewort, goodsType 8). A new Ash of a full kind dismisses one
+    /// of that kind (Nexus request, PoisonParadise).
+    pub max_regular_ashes: u32,
+    pub max_renowned_ashes: u32,
 }
 
 /// Starts the built-in Multiple Spirit Ashes once. `module` is NativeTweaks.dll
@@ -369,6 +377,8 @@ fn apply_hub_settings(hub: &NtMsaSettings) {
         current.extra_cost_percent = hub.extra_cost_percent.min(1000);
         current.damage_reduction_percent = hub.damage_reduction_percent.min(100);
         current.repeat_same_ash = hub.repeat_same_ash != 0;
+        current.max_regular_ashes = hub.max_regular_ashes.min(100) as usize;
+        current.max_renowned_ashes = hub.max_renowned_ashes.min(100) as usize;
     }
 }
 
@@ -532,6 +542,7 @@ fn install_tasks_once(version: SupportedErVersion) {
             );
             std::mem::forget(eligibility_task);
         }
+        game_thread::READY.store(true, Ordering::Release);
 
         let hud_task = task_imp.run_recurring(
             timed_hud_task as fn(&FD4TaskData),
@@ -989,6 +1000,14 @@ fn clear_owner_group_exit_requests(
 ) -> usize {
     let effect_by_buddy = buddy_trigger_map(manager);
     let mut preserved_groups = 0usize;
+    // Ashes this mod dismissed itself (Maximum regular / renowned Ashes: the
+    // oldest of a full kind fades when a new one comes) keep their exit. 23-11
+    // in game: the new Ash's clear brought the 3 fading Giant Rats back, so the
+    // cap was never enforced. try_lock: the caller may hold STATE already.
+    let dismissed: HashSet<i32> = STATE
+        .try_lock()
+        .map(|state| state.dismissed_effects.clone())
+        .unwrap_or_default();
 
     for entry in manager.groups.iter_mut() {
         if entry.first != owner_id {
@@ -998,7 +1017,7 @@ fn clear_owner_group_exit_requests(
             if !chr_alive(unsafe { group.chr_ins.as_ref() })
                 || effect_by_buddy
                     .get(&group.buddy_param_id)
-                    .is_none_or(|effect| Some(*effect) == except_effect)
+                    .is_none_or(|effect| Some(*effect) == except_effect || dismissed.contains(effect))
                 || (!group.disappear_requested && group.disappear_delay_sec < 0.0)
             {
                 continue;
@@ -1106,10 +1125,11 @@ unsafe fn scoped_native_exit_inner(manager_ptr: *mut SummonBuddyManager, native_
     let mut target_effect =
         (pending_effect > 0 && living_effects.contains(&pending_effect)).then_some(pending_effect);
     if target_effect.is_none() && manager.disappear_requested {
+        let requested_goods_effect = alias_summon_effect(requested_goods).unwrap_or(requested_goods);
         target_effect = buddy_to_trigger
             .values()
             .copied()
-            .find(|effect| *effect == requested_goods && living_effects.contains(effect));
+            .find(|effect| *effect == requested_goods_effect && living_effects.contains(effect));
         if target_effect.is_none()
             && (requested_goods <= 0 || requested_goods == manager.active_summon_goods_id)
             && living_effects.contains(&active_effect)
@@ -1160,7 +1180,7 @@ unsafe fn scoped_native_exit_inner(manager_ptr: *mut SummonBuddyManager, native_
 
     for entry in manager.groups.iter_mut() {
         for group in entry.second.iter_mut() {
-            if !chr_alive(unsafe { group.chr_ins.as_ref() }) {
+            if group.is_remote || !chr_alive(unsafe { group.chr_ins.as_ref() }) {
                 continue;
             }
             let effect = buddy_to_trigger.get(&group.buddy_param_id).copied();
@@ -1320,7 +1340,8 @@ fn live_group_count(manager: &SummonBuddyManager, effect: i32) -> usize {
         .iter()
         .flat_map(|entry| entry.second.iter())
         .filter(|group| {
-            chr_alive(unsafe { group.chr_ins.as_ref() })
+            !group.is_remote
+                && chr_alive(unsafe { group.chr_ins.as_ref() })
                 && summon_effect_for_buddy(manager, group.buddy_param_id) == Some(effect)
         })
         .count()
@@ -1503,6 +1524,21 @@ fn guarded_task(name: &str, task: impl FnOnce()) {
         log_line(format_args!(
             "task {name} panicked: Multiple Spirit Ashes stops for this session"
         ));
+        // The code patches stay installed and read flags only the tasks
+        // update: put them back to the game's own behaviour, so nothing is
+        // left half-way (a summon gate held open, prompts hidden, old HUD rows).
+        let _ = std::panic::catch_unwind(|| {
+            reset_native_prompt_flags();
+            for pending in [
+                &PENDING_SWITCH_CLEAR_EFFECT,
+                &PENDING_SWITCH_GOODS_ID,
+                &PENDING_ITEM_DISMISS_EFFECT,
+                &PENDING_ITEM_DISMISS_GOODS,
+            ] {
+                pending.store(-1, Ordering::Release);
+            }
+            hud::clear_rows_after_panic();
+        });
     }
 }
 
@@ -1513,6 +1549,11 @@ fn timed_spirit_ash_task(data: &FD4TaskData) {
 }
 
 fn timed_allow_additional_ashes_task(data: &FD4TaskData) {
+    // NativeTweaks' calls that must run in the game's task loop (game_thread.rs).
+    // Any of this task's four steps (task_group_id is not the CSTaskGroupIndex
+    // value: a GameMan-only check never ran in game, 21-11).
+    let _ = data;
+    guarded_task("game_thread", game_thread::drain);
     guarded_task("eligibility", || {
         perf::measure(perf::ELIGIBILITY, || allow_additional_ashes_task(data));
     });
@@ -1780,6 +1821,16 @@ fn spirit_ash_task(_: &FD4TaskData) {
                 living_now.len(),
                 active_effect
             ));
+            // Game decides: with the summoned flag kept, an extra Ash takes the
+            // game's own path, which spends a consumable Ash (and its FP) but
+            // leaves a plain one free (21-11: FP 62 before and after). Charge it.
+            if let ItemAction::Summon(effect) = action
+                && !settings().toggle_dismiss
+                && !living_now.is_empty()
+                && !living_now.contains(&effect)
+            {
+                extras::charge_native_extra_summon(manager.requested_summon_goods_id);
+            }
         }
 
         // The native summon update can mark existing groups for removal after
@@ -1792,7 +1843,13 @@ fn spirit_ash_task(_: &FD4TaskData) {
 
         // Vanilla derives this flag from its single active-summon slot. Clearing
         // it lets another Spirit Ash item reach the manager while older groups live.
-        manager.player_has_alive_summon = false;
+        // Item of a summoned ash = Game decides keeps it: the game's "spirit
+        // summoned" state (SpEffect state 411) then stays, which ELDEN RING
+        // Reforged's Spirit Fury item and Lord of Ashes' Desummon box need
+        // (21-11 in game: with the flag cleared they could not be used).
+        if settings().toggle_dismiss {
+            manager.player_has_alive_summon = false;
+        }
     }
 
     let all_live_groups = collect_all_live_effects(manager, &buddy_to_trigger);
@@ -2061,6 +2118,26 @@ fn goods_matches_effect(goods: i32, effect: i32) -> bool {
     }
 }
 
+/// A Spirit Ash item with its own goods ID that calls the summon SpEffect of
+/// another Ash: EquipParamGoods goodsType 7/8, refCategory 2 (SpEffect),
+/// refId_default != goods ID. Lord of Ashes' "Desummon" box is one (241020 ->
+/// 241000, 233020 -> 233000): the consumable Ash turns into it when used, and
+/// using it while that Ash lives is the game's dismissal (GetBuddyState 2).
+/// Returns that effect; None for the game's own ashes (goods = effect).
+pub(crate) fn alias_summon_effect(goods: i32) -> Option<i32> {
+    let goods_id = u32::try_from(goods).ok()?;
+    let repository = unsafe { SoloParamRepository::instance().ok()? };
+    let row = repository.get::<EquipParamGoods>(goods_id)?;
+    let effect = row.ref_id_default();
+    (matches!(row.goods_type(), 7 | 8) && row.ref_category() == 2 && effect > 0 && effect != goods)
+        .then_some(effect)
+}
+
+/// Whether a goods ID is an alias item (see alias_summon_effect) of a living Ash.
+pub(crate) fn alias_of_living_ash(goods: i32, live_effects: &HashSet<i32>) -> bool {
+    alias_summon_effect(goods).is_some_and(|effect| live_effects.contains(&effect))
+}
+
 fn update_summon_dialog_policy(
     manager: &SummonBuddyManager,
     live_effects: &HashSet<i32>,
@@ -2148,7 +2225,9 @@ fn update_summon_dialog_policy(
     // Do not require the goods row to have been captured by the initial param
     // scan: some builds leave the selected row out of use_limit_summon_buddy,
     // while the game sources the prompt from the currently active Ash row.
-    let requested_goods_is_living = active_goods_ids.contains(&requested_goods);
+    // Lord of Ashes' Desummon box has its own goods ID: it is the living Ash's.
+    let requested_goods_is_living = active_goods_ids.contains(&requested_goods)
+        || alias_of_living_ash(requested_goods, live_effects);
     let requested_goods_is_summon = state.summon_dialog_originals.contains_key(&requested_goods);
     let pending_new_summon_goods = (suppress_new_summon
         && !live_effects.is_empty()
@@ -2422,6 +2501,7 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
                     ));
                 }
             } else {
+                extras::make_room_in_kind(manager, &buddy_to_trigger, request_effect, &mut state);
                 record_dismissal_target(
                     request_effect,
                     &all_live_effects,
@@ -2447,7 +2527,9 @@ fn allow_additional_ashes_task(data: &FD4TaskData) {
         recover_scoped_native_handoff(manager, &buddy_to_trigger, &mut state);
         protect_existing_groups(manager, &buddy_to_trigger, &state.dismissed_effects);
     }
-    manager.player_has_alive_summon = false;
+    if settings().toggle_dismiss {
+        manager.player_has_alive_summon = false;
+    }
 }
 
 fn forward_pending_switch_request(
@@ -2524,6 +2606,7 @@ fn forward_pending_switch_request(
         active_goods,
         living_effects.len()
     ));
+    extras::charge_forwarded_summon(requested_goods);
 }
 
 fn arm_direct_summon_guard(
@@ -2723,7 +2806,8 @@ fn handle_live_item_dismissal(
     let delay = DISMISS_FADE_SECONDS;
     for entry in manager.groups.iter_mut() {
         for group in entry.second.iter_mut() {
-            if !chr_alive(unsafe { group.chr_ins.as_ref() })
+            if group.is_remote
+                || !chr_alive(unsafe { group.chr_ins.as_ref() })
                 || buddy_to_trigger.get(&group.buddy_param_id).copied() != Some(target_effect)
             {
                 continue;
@@ -2873,7 +2957,10 @@ fn restore_native_exit_active_slot(
         .iter()
         .flat_map(|entry| entry.second.iter())
         .filter_map(|group| {
-            if !chr_alive(unsafe { group.chr_ins.as_ref() }) || group.disappear_requested {
+            if group.is_remote
+                || !chr_alive(unsafe { group.chr_ins.as_ref() })
+                || group.disappear_requested
+            {
                 return None;
             }
             buddy_to_trigger
@@ -3049,10 +3136,12 @@ fn observe_confirmed_vanilla_dismissal(
     // remove a non-active Ash without allowing the native owner-wide clear.
     if manager.disappear_requested {
         let requested_goods = manager.requested_summon_goods_id;
+        // Lord of Ashes' Desummon box: its goods ID is not the Ash's effect.
+        let requested_goods_effect = alias_summon_effect(requested_goods).unwrap_or(requested_goods);
         let selected_living_effect = buddy_to_trigger
             .values()
             .copied()
-            .find(|effect| *effect == requested_goods && currently_living.contains(effect));
+            .find(|effect| *effect == requested_goods_effect && currently_living.contains(effect));
         if let Some(target_effect) = selected_living_effect {
             if !state.dismissed_effects.contains(&target_effect) {
                 log_line(format_args!(
@@ -3114,10 +3203,12 @@ fn observe_confirmed_vanilla_dismissal(
     // Spirit Ash item to another. That is a replacement path, not the player's
     // request to dismiss the currently active Ash. Goods IDs remain different
     // during this transition even when request_summon_speffect_id is still -1.
+    // A Desummon box of the active Ash is not another Ash.
     let switching_to_another_ash = request_effect <= 0
         && manager.requested_summon_goods_id > 0
         && manager.active_summon_goods_id > 0
-        && manager.requested_summon_goods_id != manager.active_summon_goods_id;
+        && manager.requested_summon_goods_id != manager.active_summon_goods_id
+        && alias_summon_effect(manager.requested_summon_goods_id) != Some(active_effect);
     if switching_to_another_ash {
         state.dismissed_effects.remove(&active_effect);
         report_preserved_effect(active_effect, "pending_ash_switch");
@@ -3169,7 +3260,8 @@ fn protect_existing_groups(
             let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
                 continue;
             };
-            if !chr_alive(unsafe { group.chr_ins.as_ref() })
+            if group.is_remote
+                || !chr_alive(unsafe { group.chr_ins.as_ref() })
                 || dismissed_effects.contains(&effect)
                 || PENDING_ITEM_DISMISS_EFFECT.load(Ordering::Acquire) as i32 == effect
                 || (!group.disappear_requested && group.disappear_delay_sec < 0.0)
@@ -3198,7 +3290,8 @@ fn recover_scoped_native_handoff(
     }
     let target_is_exiting = manager.groups.iter().any(|entry| {
         entry.second.iter().any(|group| {
-            buddy_to_trigger.get(&group.buddy_param_id).copied() == Some(effect)
+            !group.is_remote
+                && buddy_to_trigger.get(&group.buddy_param_id).copied() == Some(effect)
                 && group.disappear_requested
                 && group.disappear_delay_sec.is_finite()
                 && group.disappear_delay_sec >= 0.0
@@ -3264,7 +3357,8 @@ fn update_dismissal_fades(
     {
         let native_exit = manager.groups.iter().find_map(|entry| {
             entry.second.iter().find_map(|group| {
-                if buddy_to_trigger.get(&group.buddy_param_id).copied() != Some(effect)
+                if group.is_remote
+                    || buddy_to_trigger.get(&group.buddy_param_id).copied() != Some(effect)
                     || !group.disappear_requested
                     || !chr_alive(unsafe { group.chr_ins.as_ref() })
                 {
@@ -3300,7 +3394,8 @@ fn update_dismissal_fades(
             let mut shortened_groups = 0usize;
             for entry in manager.groups.iter_mut() {
                 for group in entry.second.iter_mut() {
-                    if buddy_to_trigger.get(&group.buddy_param_id).copied() != Some(effect)
+                    if group.is_remote
+                        || buddy_to_trigger.get(&group.buddy_param_id).copied() != Some(effect)
                         || !group.disappear_requested
                         || !chr_alive(unsafe { group.chr_ins.as_ref() })
                     {
@@ -3423,6 +3518,9 @@ fn update_dismissal_fades(
         for group in entry.second.iter_mut() {
             let character_key = group.chr_ins.as_ptr() as usize;
             live_characters.insert(character_key);
+            if group.is_remote {
+                continue;
+            }
             let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
                 if let Some(backup) = fade_backups.remove(&character_key) {
                     restore_dismissal_fade(group, backup);
@@ -3539,7 +3637,10 @@ fn apply_dismissal_visual_effect(
     let mut fading_characters = HashSet::new();
     for entry in manager.groups.iter() {
         for group in entry.second.iter() {
-            if !group.disappear_requested || !chr_alive(unsafe { group.chr_ins.as_ref() }) {
+            if group.is_remote
+                || !group.disappear_requested
+                || !chr_alive(unsafe { group.chr_ins.as_ref() })
+            {
                 continue;
             }
             if let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied()
@@ -3632,7 +3733,8 @@ fn apply_dismissal_visual_effect(
             let Some(target_effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
                 continue;
             };
-            if !state.dismissed_effects.contains(&target_effect)
+            if group.is_remote
+                || !state.dismissed_effects.contains(&target_effect)
                 || !group.disappear_requested
                 || !chr_alive(unsafe { group.chr_ins.as_ref() })
                 || state
@@ -3778,6 +3880,9 @@ fn apply_item_action(
 
     for entry in manager.groups.iter_mut() {
         for group in entry.second.iter_mut() {
+            if group.is_remote {
+                continue;
+            }
             let Some(effect) = buddy_to_trigger.get(&group.buddy_param_id).copied() else {
                 continue;
             };
@@ -3928,7 +4033,8 @@ fn collect_effects(
     let mut effects = HashSet::new();
     for entry in manager.groups.iter() {
         for group in entry.second.iter() {
-            if !include_dismissing && group.disappear_requested {
+            // Seamless Co-op: the partner's replicated Ashes are theirs, not ours.
+            if group.is_remote || (!include_dismissing && group.disappear_requested) {
                 continue;
             }
             if !chr_alive(unsafe { group.chr_ins.as_ref() }) {
@@ -3963,6 +4069,9 @@ struct Settings {
     toggle_dismiss: bool,
     /// See NtMsaSettings::repeat_same_ash.
     repeat_same_ash: bool,
+    /// See NtMsaSettings::max_regular_ashes / max_renowned_ashes (0 = none).
+    max_regular_ashes: usize,
+    max_renowned_ashes: usize,
     suppress_spirit_ash_confirmation: bool,
     suppress_additional_summon_prompt: bool,
     patch_hud_movie: bool,
@@ -3983,6 +4092,8 @@ impl Settings {
         max_active_ashes: 8,
         toggle_dismiss: true,
         repeat_same_ash: false,
+        max_regular_ashes: 0,
+        max_renowned_ashes: 0,
         suppress_spirit_ash_confirmation: false,
         suppress_additional_summon_prompt: true,
         patch_hud_movie: true,
@@ -4061,6 +4172,14 @@ mod tests {
     }
 
     #[test]
+    fn hub_settings_layout_matches_the_hub() {
+        // src/spirit_ashes.cpp: static_assert(sizeof(NtMsaSettings) == 36).
+        assert_eq!(std::mem::size_of::<NtMsaSettings>(), 36);
+        assert_eq!(std::mem::offset_of!(NtMsaSettings, max_regular_ashes), 28);
+        assert_eq!(std::mem::offset_of!(NtMsaSettings, max_renowned_ashes), 32);
+    }
+
+    #[test]
     fn upgraded_ashes_resolve_to_their_base_entry() {
         // The game's map holds only +0 trigger effects (Finlay 223000, Jellyfish
         // 200000); upgraded items use +1..+10 (223010 = Finlay +10).
@@ -4127,6 +4246,8 @@ mod tests {
             extra_cost_percent: 50,
             damage_reduction_percent: 10,
             repeat_same_ash: 0,
+            max_regular_ashes: 0,
+            max_renowned_ashes: 0,
         });
         let applied = settings();
         assert!(applied.enabled);
@@ -4149,6 +4270,8 @@ mod tests {
             extra_cost_percent: 100,
             damage_reduction_percent: 0,
             repeat_same_ash: 0,
+            max_regular_ashes: 0,
+            max_renowned_ashes: 0,
         });
         let off = settings();
         assert!(!off.enabled);

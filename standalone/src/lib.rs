@@ -51,6 +51,10 @@ struct Config {
     keep_ashes_after_boss: bool,
     resummon_without_rest: bool,
     repeat_same_ash: bool,
+    /// RepeatSameAsh=game: a summoned ash's item is left to the game.
+    item_to_game: bool,
+    max_regular_ashes: u32,
+    max_renowned_ashes: u32,
     solid_ashes: bool,
     free_fighting: u8,
     dismiss_all_key: Option<i32>,
@@ -70,6 +74,9 @@ impl Default for Config {
             keep_ashes_after_boss: true,
             resummon_without_rest: true,
             repeat_same_ash: false,
+            item_to_game: false,
+            max_regular_ashes: 0,
+            max_renowned_ashes: 0,
             solid_ashes: false,
             free_fighting: FREE_FIGHTING_OFF,
             dismiss_all_key: None,
@@ -88,7 +95,7 @@ fn run(module: isize) {
         enabled: u8::from(config.enabled),
         max_active_ashes: config.max_active_ashes,
         log_enabled: u8::from(config.log_enabled),
-        toggle_dismiss: 1,
+        toggle_dismiss: u8::from(!config.item_to_game),
         suppress_prompts: 1,
         follow_areas: 1,
         fast_dismissal: 1,
@@ -97,6 +104,8 @@ fn run(module: isize) {
         extra_cost_percent: config.extra_cost_percent,
         damage_reduction_percent: config.damage_reduction_percent,
         repeat_same_ash: u8::from(config.repeat_same_ash),
+        max_regular_ashes: config.max_regular_ashes,
+        max_renowned_ashes: config.max_renowned_ashes,
     };
     mark_standalone();
     nt_msa_set_ash_cost_percent(config.ash_cost_percent);
@@ -193,7 +202,23 @@ fn parse_config(text: &str) -> Config {
                     parse_bool(value).unwrap_or(config.resummon_without_rest)
             }
             "repeatsameash" => {
-                config.repeat_same_ash = parse_bool(value).unwrap_or(config.repeat_same_ash)
+                if value.eq_ignore_ascii_case("game") {
+                    config.repeat_same_ash = false;
+                    config.item_to_game = true;
+                } else if let Some(parsed) = parse_bool(value) {
+                    config.repeat_same_ash = parsed;
+                    config.item_to_game = false;
+                }
+            }
+            "maxregularashes" => {
+                if let Ok(parsed) = value.parse::<u32>() {
+                    config.max_regular_ashes = parsed.min(100);
+                }
+            }
+            "maxrenownedashes" => {
+                if let Ok(parsed) = value.parse::<u32>() {
+                    config.max_renowned_ashes = parsed.min(100);
+                }
             }
             "solidashes" => config.solid_ashes = parse_bool(value).unwrap_or(config.solid_ashes),
             "freefighting" => {
@@ -285,6 +310,16 @@ mod tests {
         assert_eq!(parse_free_fighting("sometimes"), None);
         let kept = parse_config("FreeFighting=sometimes\n");
         assert_eq!(kept.free_fighting, FREE_FIGHTING_OFF);
+    }
+
+    #[test]
+    fn repeat_same_ash_accepts_game() {
+        let game = parse_config("RepeatSameAsh=game\n");
+        assert!(game.item_to_game && !game.repeat_same_ash);
+        let again = parse_config("RepeatSameAsh=true\n");
+        assert!(again.repeat_same_ash && !again.item_to_game);
+        let off = parse_config("RepeatSameAsh=false\n");
+        assert!(!off.repeat_same_ash && !off.item_to_game);
     }
 
     #[test]

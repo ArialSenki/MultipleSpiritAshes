@@ -218,6 +218,19 @@ fn spirit_slots(code: &(usize, &[u8])) {
         &[0x41, 0xba, 0x14, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x40, 0x00],
     );
     let search_ok = start_ok && native_prompt::write_executable_patch(site, &jump, "spirit slots (search)");
+    if start_ok && !search_ok {
+        // Start 20 for everyone with the game's 10-slot search would make
+        // every player share slots 20-29: the start goes back too.
+        let reverted = patch(
+            code,
+            "spirit slots (start, undo)",
+            "41 ba 14 00 00 00 0f 1f 40 00 b8 67 66 66 66 41 f7 e9",
+            0,
+            &[0x41, 0xba, 0x14, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x40, 0x00],
+            &[0x83, 0xc0, 0x02, 0x8d, 0x04, 0x80, 0x44, 0x8d, 0x14, 0x00],
+        );
+        log_line(format_args!("spirit slots: start patch undone: {reverted}"));
+    }
     log_line(format_args!(
         "spirit slots: {}",
         if search_ok { "shared up to the set's capacity" } else { "10 per player" }
