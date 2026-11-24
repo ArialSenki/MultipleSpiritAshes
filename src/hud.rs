@@ -30,7 +30,7 @@ use std::{
 
 use eldenring::{
     cs::{
-        BuddyParam, CSFeManImp, ChrFriendTagEntry, FieldInsHandle, MsgRepositoryImp, NpcParam,
+        BuddyParam, CSFeManImp, ChrFriendTagEntry, EquipParamGoods, FieldInsHandle, MsgRepositoryImp, NpcParam,
         SoloParamRepository, SummonBuddyManager, WorldChrMan,
     },
     fd4::FD4TaskData,
@@ -429,7 +429,11 @@ fn ash_name(
     if misses.get(&effect).is_some_and(|retry| now < *retry) {
         return FALLBACK_NAME.to_owned();
     }
-    let found = lookup_message(&GOODS_NAME_CATEGORIES, effect).or_else(|| {
+    let found = overhaul_ash_goods(effect, true)
+        .and_then(|goods| lookup_message(&GOODS_NAME_CATEGORIES, goods))
+        .or_else(|| lookup_message(&GOODS_NAME_CATEGORIES, effect))
+        .or_else(|| overhaul_ash_goods(effect, false).and_then(|goods| lookup_message(&GOODS_NAME_CATEGORIES, goods)))
+        .or_else(|| {
         members
             .iter()
             .map(|member| member.npc_name_id)
@@ -448,6 +452,33 @@ fn ash_name(
             FALLBACK_NAME.to_owned()
         }
     }
+}
+
+/// The overhaul's own Ash item that summons through `effect`, when the
+/// goods row with that id is not it (ELDEN RING Reforged: its Ashes are
+/// 300000+, refId_default is the vanilla Ash id, and the vanilla row is now
+/// named "Depleted ..."). Found by an Ash row (goodsType 7/8) with another
+/// id, refId_default = effect and a replaceItemId (Reforged's used form);
+/// the game's own Ashes have refId_default = their id and no replaceItemId.
+/// Without `paired`, any other Ash row with that refId_default (The
+/// Convergence: 2400000 summons through 400000, which has no goods name).
+fn overhaul_ash_goods(effect: i32, paired: bool) -> Option<i32> {
+    let repository = unsafe { SoloParamRepository::instance().ok()? };
+    if paired
+        && repository
+            .get::<EquipParamGoods>(effect as u32)
+            .is_some_and(|row| row.replace_item_id() != -1)
+    {
+        return None; // the effect's own row is already an overhaul Ash
+    }
+    repository.rows::<EquipParamGoods>().find_map(|(id, row)| {
+        let id = i32::try_from(id).ok()?;
+        (id != effect
+            && matches!(row.goods_type(), 7 | 8)
+            && row.ref_id_default() == effect
+            && (!paired || row.replace_item_id() != -1))
+            .then_some(id)
+    })
 }
 
 /// How often a name that was not found is looked up again.

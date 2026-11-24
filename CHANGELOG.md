@@ -2,6 +2,14 @@
 
 Same entries as the [Nexus page](https://www.nexusmods.com/eldenring/mods/11158). Newest first.
 
+## 1.0.5
+
+- Fixed: every extra ash pays its FP or HP once and uses up consumable ashes, like the first one (Lord of Ashes boxes no longer stay full). Nexus report.
+- Added: MaxRegularAshes and MaxRenownedAshes, the most ashes of each kind out at once (0 = no limit). Summoning one more of a full kind sends one of that kind away. Nexus request.
+- Added: RepeatSameAsh=game leaves a summoned ash's item to the game, so Elden Ring Reforged's Spirit Fury can enrage it while several ashes are out. Lord of Ashes' Desummon dismisses its ash, also far from a monument (with SummonAnywhere=true the mod gives you the state a monument would).
+- Fixed: HUD rows show the name of Reforged's and Convergence's own ashes instead of "Depleted ...". Seamless Co-op partners' ashes are left alone.
+- Update: replace the DLL and add the two new lines (MaxRegularAshes, MaxRenownedAshes) from the new INI if you want a limit per kind; an INI without them means no limit.
+
 ## 1.0.4
 
 - Changed: free fighting is now off by default (FreeFighting=Off), so nothing changes unless you turn it on in the INI: Bosses or Everywhere.
